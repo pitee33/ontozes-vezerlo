@@ -5,6 +5,7 @@
  *   - Wemos D1 Mini (ESP8266)
  *   - 4 csatorna relé board (aktív alacsony = LOW be, HIGH ki)
  *   - SSD1306 OLED (SDA=GPIO12/D6, SCL=GPIO14/D5)
+ *   - DHT11 hőmérséklet/pára (GPIO13/D7)
  *   - NTP időszinkron (nincs RTC)
  * 
  * Funkciók:
@@ -35,6 +36,7 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+#include <DHT.h>
 
 // ==================== KONFIGURÁCIÓ ====================
 
@@ -61,6 +63,10 @@
 #define RELAY4_PIN    D4   // GPIO2 — Zone 4
 #define RELAY_ON      HIGH
 #define RELAY_OFF     LOW
+
+// DHT11 hőmérséklet/pára szenzor (GPIO13/D7)
+#define DHT_PIN       D7
+#define DHT_TYPE      DHT11
 
 // OLED (Ideaspark v2.1: SDA=GPIO12/D6, SCL=GPIO14/D5, addr 0x3C)
 #define OLED_ADDR     0x3C
@@ -126,6 +132,12 @@ unsigned long lastNtpSync = 0;
 bool wifiConnected = false;
 bool ntpSynced = false;
 String currentVersion = FIRMWARE_VERSION;
+
+// DHT11 szenzor
+DHT dht(DHT_PIN, DHT_TYPE);
+float dhtTemp = NAN;
+float dhtHum = NAN;
+unsigned long lastDhtRead = 0;
 
 // ==================== FUNKCIÓK ====================
 
@@ -225,11 +237,14 @@ void updateOled() {
     
     display.setCursor(0, 40);
     unsigned long upSec = millis() / 1000;
-    display.print("Uptime: " + String(upSec / 3600) + "h " + 
+    display.print("Up: " + String(upSec / 3600) + "h " + 
                   String((upSec % 3600) / 60) + "m");
     
-    display.setCursor(0, 53);
-    display.print("4ch TG+Blynk " + currentVersion);
+    display.setCursor(0, 50);
+    if (!isnan(dhtTemp)) {
+      display.print(String((int)dhtTemp) + "C " + String((int)dhtHum) + "% ");
+    }
+    display.print(currentVersion);
   }
   
   // Oldalszám jelzés (jobb alsó sarok)
@@ -558,6 +573,9 @@ String getStatusText() {
   }
   txt += "FW: " + currentVersion + "\n";
   txt += "WiFi: " + String(WiFi.RSSI()) + " dBm\n";
+  if (!isnan(dhtTemp)) {
+    txt += "🌡 " + String((int)dhtTemp) + "°C  💧" + String((int)dhtHum) + "%\n";
+  }
   txt += "Heap: " + String(ESP.getFreeHeap() / 1024) + " kB\n";
   unsigned long secs = millis() / 1000;
   txt += "Uptime: " + String(secs / 3600) + "ó " + String((secs % 3600) / 60) + "p";
@@ -785,6 +803,10 @@ void setup() {
     Serial.println("OLED nem talalhato! (0x3C/0x3D)");
   }
   
+  // DHT11 inicializálás
+  dht.begin();
+  Serial.println("DHT11 init (GPIO13/D7)");
+  
   // WiFi
   Serial.println("WiFi csatlakozás...");
   WiFi.mode(WIFI_STA);
@@ -879,6 +901,20 @@ void loop() {
   if (now - lastNtpSync > 3600000) {
     lastNtpSync = now;
     if (wifiConnected) syncNTP(true);
+  }
+
+  // DHT11 olvasás (30 másodpercenként)
+  if (now - lastDhtRead > 30000) {
+    lastDhtRead = now;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      dhtTemp = t;
+      dhtHum = h;
+      Serial.printf("DHT: %.1f°C, %.0f%%\n", t, h);
+    } else {
+      Serial.println("DHT olvasás sikertelen");
+    }
   }
   
   // Firmware check (6 óránként)
