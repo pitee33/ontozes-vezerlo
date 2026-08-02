@@ -576,7 +576,9 @@ String getStatusText() {
   if (!isnan(dhtTemp)) {
     txt += "🌡 " + String((int)dhtTemp) + "°C  💧" + String((int)dhtHum) + "%\n";
   }
-  txt += "Heap: " + String(ESP.getFreeHeap() / 1024) + " kB\n";
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t totalHeap = 81920;  // ESP8266 fix 80KB heap
+  txt += "Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
   unsigned long secs = millis() / 1000;
   txt += "Uptime: " + String(secs / 3600) + "ó " + String((secs % 3600) / 60) + "p";
   return txt;
