@@ -69,7 +69,7 @@
 #define OLED_RST      -1
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.0.7"
+#define FIRMWARE_VERSION  "1.0.8"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -557,7 +557,10 @@ String getStatusText() {
     txt += "\n⚠️ NTP nincs szinkronizálva\n";
   }
   txt += "FW: " + currentVersion + "\n";
-  txt += "WiFi: " + String(WiFi.RSSI()) + " dBm";
+  txt += "WiFi: " + String(WiFi.RSSI()) + " dBm\n";
+  txt += "Heap: " + String(ESP.getFreeHeap() / 1024) + " kB\n";
+  unsigned long secs = millis() / 1000;
+  txt += "Uptime: " + String(secs / 3600) + "ó " + String((secs % 3600) / 60) + "p";
   return txt;
 }
 
