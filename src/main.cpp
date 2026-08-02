@@ -75,7 +75,7 @@
 #define OLED_RST      -1
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.0.8"
+#define FIRMWARE_VERSION  "1.0.9"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
