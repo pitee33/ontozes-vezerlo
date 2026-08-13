@@ -120,10 +120,12 @@ unsigned long lastPageSwitch = 0;
 bool oledSleeping = false;
 unsigned long lastActivity = 0;
 
-// FLASH gomb — egyszerű lenyomás érzékelés cooldown-nal
-bool btnWasPressed = false;
-unsigned long lastBtnDebug = 0;
-int lastDbgState = -999;
+// FLASH gomb — interrupt alapú, azonnali reakció
+volatile bool btnPressedFlag = false;
+
+void ICACHE_RAM_ATTR flashBtnISR() {
+  btnPressedFlag = true;
+}
 
 #define NUM_ZONES 4
 
@@ -182,6 +184,11 @@ void wakeOled() {
     oledSleeping = false;
     // Azonnal rajzoljon újra — különben üres képernyő
     lastOledUpdate = 0;  // kényszeríti a loop-ban lévő updateOled()-et
+    // Kék LED bekapcsolása (GPIO2/D4 — aktív LOW a beépített LED)
+    // Csak ha Z4 relé nincs aktív — ne zavarja a relét
+    if (!zones[3].active) {
+      digitalWrite(RELAY4_PIN, LOW);  // LED be (LOW = ON a NodeMCU LED-nél)
+    }
     Serial.println("OLED wake");
   }
   lastActivity = millis();
@@ -192,33 +199,24 @@ void checkOledSleep() {
   if (millis() - lastActivity > OLED_SLEEP_MS) {
     display.ssd1306_command(SSD1306_DISPLAYOFF);
     oledSleeping = true;
-    Serial.println("OLED sleep (inaktivitas)");
+    // Kék LED kikapcsolása (GPIO2/D4 — HIGH = OFF a NodeMCU LED-nél)
+    // Csak ha Z4 relé nincs aktív
+    if (!zones[3].active) {
+      digitalWrite(RELAY4_PIN, HIGH);  // LED ki
+    }
+    Serial.println("OLED sleep (inaktivitas) + LED ki");
   }
 }
 
 // ==================== FLASH GOMB ====================
 
 void checkFlashButton() {
-  int reading = digitalRead(FLASH_BTN_PIN);
-  
-  // Debug: kiírja a pin állapotát 2 másodpercenként
-  unsigned long now = millis();
-  if (now - lastBtnDebug > 2000) {
-    lastBtnDebug = now;
-    if (reading != lastDbgState) {
-      Serial.printf("FLASH pin state: %d (sleeping=%d)\n", reading, oledSleeping);
-      lastDbgState = reading;
-    }
-  }
-  
-  // Él detektálás: HIGH→LOW = gomb lenyomva
-  if (reading == LOW && !btnWasPressed) {
-    btnWasPressed = true;
+  if (btnPressedFlag) {
+    btnPressedFlag = false;
+    // Debounce: várjon amíg felengedik, de ne blokkolja sokáig
+    delay(30);
     wakeOled();
-    Serial.println("FLASH gomb LENYOMVA -> OLED wake");
-  }
-  if (reading == HIGH) {
-    btnWasPressed = false;
+    Serial.println("FLASH gomb (ISR) -> OLED wake");
   }
 }
 
@@ -1078,8 +1076,9 @@ void setup() {
   digitalWrite(RELAY3_PIN, RELAY_OFF);
   digitalWrite(RELAY4_PIN, RELAY_OFF);
   
-  // FLASH gomb (GPIO0/D3) — input, beépített pull-up
+  // FLASH gomb (GPIO0/D3) — input, beépített pull-up + interrupt
   pinMode(FLASH_BTN_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLASH_BTN_PIN), flashBtnISR, FALLING);
   
   // LittleFS
   LittleFS.begin();
