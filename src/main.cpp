@@ -214,8 +214,6 @@ void checkFlashButton() {
     btnWasPressed = true;
     wakeOled();
     Serial.println("FLASH gomb LENYOMVA -> OLED wake");
-    // Debug: Telegram értesítés (csak admin)
-    botAdmin.sendMessage(ADMIN_CHAT_ID, "🔴 FLASH gomb érzékelve! OLED wake", "");
   }
   if (reading == HIGH) {
     btnWasPressed = false;
