@@ -180,6 +180,8 @@ void wakeOled() {
   if (oledSleeping) {
     display.ssd1306_command(SSD1306_DISPLAYON);
     oledSleeping = false;
+    // Azonnal rajzoljon újra — különben üres képernyő
+    lastOledUpdate = 0;  // kényszeríti a loop-ban lévő updateOled()-et
     Serial.println("OLED wake");
   }
   lastActivity = millis();
