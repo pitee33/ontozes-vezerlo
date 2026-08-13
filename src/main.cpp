@@ -214,6 +214,8 @@ void checkFlashButton() {
     btnWasPressed = true;
     wakeOled();
     Serial.println("FLASH gomb LENYOMVA -> OLED wake");
+    // Debug: Telegram értesítés (csak admin)
+    botAdmin.sendMessage(ADMIN_CHAT_ID, "🔴 FLASH gomb érzékelve! OLED wake", "");
   }
   if (reading == HIGH) {
     btnWasPressed = false;
@@ -824,6 +826,8 @@ String getHelpText(bool isAdmin) {
     h += "  pl: /clear 1 2 (csak slot 2)\n";
     h += "/upgrade — Firmware frissítés\n";
     h += "/reboot — Újraindítás\n";
+    h += "/flash — FLASH gomb debug\n";
+    h += "/wake — OLED ébresztése\n";
   }
   return h;
 }
@@ -977,6 +981,31 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     bot.sendMessage(chatId, "🔄 Újraindítás...", "");
     delay(500);
     ESP.restart();
+    return;
+  }
+  
+  // Debug: FLASH gomb pin állapot
+  if (text == "/flash" && isAdmin) {
+    int pinState = digitalRead(FLASH_BTN_PIN);
+    String msg = "🔍 FLASH gomb debug:\n";
+    msg += "Pin (D3/GPIO0): " + String(pinState) + "\n";
+    msg += "OLED sleeping: " + String(oledSleeping ? "IGEN" : "NEM") + "\n";
+    msg += "OLED present: " + String(oledPresent ? "IGEN" : "NEM") + "\n";
+    msg += "Inaktivitás: " + String((millis() - lastActivity) / 1000) + " mp\n";
+    msg += "Sleep timeout: " + String(OLED_SLEEP_MS / 1000) + " mp\n";
+    if (pinState == LOW) {
+      msg += "\n⚠️ Pin LOW — gomb lenyomva vagy lehúzva!";
+    } else {
+      msg += "\n✅ Pin HIGH — gomb felengedve, pull-up OK";
+    }
+    bot.sendMessage(chatId, msg, "");
+    return;
+  }
+  
+  // Debug: OLED wake manuális
+  if (text == "/wake" && isAdmin) {
+    wakeOled();
+    bot.sendMessage(chatId, "💡 OLED ébresztve! Sleeping: " + String(oledSleeping ? "IGEN" : "NEM"), "");
     return;
   }
   
