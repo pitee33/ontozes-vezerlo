@@ -1,16 +1,21 @@
 /*
  * Öntözésvezérlés ESP8266 + Telegram + Blynk
- * 
+ * FW v1.1.0 — OLED sleep, FLASH gomb ébresztés, több ütemezés/zóna
+ *
  * Hardware:
  *   - Wemos D1 Mini (ESP8266)
- *   - 4 csatorna relé board (aktív alacsony = LOW be, HIGH ki)
+ *   - 4 csatorna relé board (aktív magas = HIGH be, LOW ki)
+ *     D1=Z1, D2=Z2, D0=Z3, D4=Z4
  *   - SSD1306 OLED (SDA=GPIO12/D6, SCL=GPIO14/D5)
  *   - DHT11 hőmérséklet/pára (GPIO13/D7)
+ *   - FLASH gomb (GPIO0/D3) — OLED ébresztés
  *   - NTP időszinkron (nincs RTC)
- * 
+ *
  * Funkciók:
  *   - 4 zóna relé vezérlés
- *   - Napi időzítés (LittleFS-ben tárolva, reboot-t túlél)
+ *   - Több ütemezés zónánként (max 4/zóna)
+ *   - OLED kikapcsolása 2 perc inaktivitás után
+ *   - FLASH gomb ébreszti az OLED-et
  *   - 2 Telegram bot (Admin + Admin2)
  *   - Blynk dashboard
  *   - Hardware Watchdog
@@ -56,13 +61,16 @@
 #define BLYNK_AUTH_TOKEN    "yZ2fyi267XuP3ZHqlHqW76xvmt9bCc5O"
 
 // Relé board (aktív magas — HIGH = be, LOW = ki)
-// OLED: SDA=GPIO12/D6, SCL=GPIO14/D5 — relék D1-D4!
+// FIGYELEM: Z3 áthelyezve D3-ról D0-ra (GPIO0 felszabadítva FLASH gombnak)
 #define RELAY1_PIN    D1   // GPIO5 — Zone 1
 #define RELAY2_PIN    D2   // GPIO4 — Zone 2
-#define RELAY3_PIN    D3   // GPIO0 — Zone 3
+#define RELAY3_PIN    D0   // GPIO16 — Zone 3 (áthelyezve D3-ról)
 #define RELAY4_PIN    D4   // GPIO2 — Zone 4
 #define RELAY_ON      HIGH
 #define RELAY_OFF     LOW
+
+// FLASH gomb (NodeMCU beépített gomb, GPIO0/D3)
+#define FLASH_BTN_PIN D3   // GPIO0 — OLED ébresztés
 
 // DHT11 hőmérséklet/pára szenzor (GPIO13/D7)
 #define DHT_PIN       D7
@@ -74,8 +82,14 @@
 #define OLED_H        64
 #define OLED_RST      -1
 
+// OLED sleep timeout (2 perc inaktivitás)
+#define OLED_SLEEP_MS 120000UL
+
+// Maximum ütemezések zónánként
+#define MAX_SCHEDULES 4
+
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.0.9"
+#define FIRMWARE_VERSION  "1.1.0"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -99,28 +113,48 @@ BlynkTimer blynkTimer;
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
 bool oledPresent = false;
 unsigned long lastOledUpdate = 0;
-int oledPage = 0;           // 0 = státusz, 1 = ütemezés
+int oledPage = 0;           // 0 = státusz, 1 = rendszer, 2 = ütemezés
 unsigned long lastPageSwitch = 0;
 
+// OLED sleep
+bool oledSleeping = false;
+unsigned long lastActivity = 0;
+
+// FLASH gomb debounce
+int btnStableState = HIGH;
+int btnLastReading = HIGH;
+unsigned long btnLastChange = 0;
+
 #define NUM_ZONES 4
+
+struct Schedule {
+  bool enabled;
+  int hour;
+  int min;
+  int duration;
+};
 
 struct Zone {
   int pin;
   bool active;
   unsigned long startTime;
   int durationMinutes;
-  // Ütemezés
-  bool scheduled;
-  int schedHour;
-  int schedMin;
-  int schedDuration;
+  Schedule schedules[MAX_SCHEDULES];
 };
 
 Zone zones[NUM_ZONES] = {
-  { RELAY1_PIN, false, 0, 0, false, 6, 30, 10 },
-  { RELAY2_PIN, false, 0, 0, false, 7, 0, 10 },
-  { RELAY3_PIN, false, 0, 0, false, 18, 0, 15 },
-  { RELAY4_PIN, false, 0, 0, false, 19, 0, 15 }
+  { RELAY1_PIN, false, 0, 0, {
+    { true, 6, 30, 10 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }
+  }},
+  { RELAY2_PIN, false, 0, 0, {
+    { true, 7, 0, 10 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }
+  }},
+  { RELAY3_PIN, false, 0, 0, {
+    { true, 18, 0, 15 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }
+  }},
+  { RELAY4_PIN, false, 0, 0, {
+    { true, 19, 0, 15 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }, { false, 0, 0, 0 }
+  }}
 };
 
 unsigned long lastBotPoll = 0;
@@ -139,7 +173,108 @@ float dhtTemp = NAN;
 float dhtHum = NAN;
 unsigned long lastDhtRead = 0;
 
-// ==================== FUNKCIÓK ====================
+// ==================== OLED SLEEP / WAKE ====================
+
+void wakeOled() {
+  if (!oledPresent) return;
+  if (oledSleeping) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    oledSleeping = false;
+    Serial.println("OLED wake");
+  }
+  lastActivity = millis();
+}
+
+void checkOledSleep() {
+  if (!oledPresent || oledSleeping) return;
+  if (millis() - lastActivity > OLED_SLEEP_MS) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    oledSleeping = true;
+    Serial.println("OLED sleep (inaktivitas)");
+  }
+}
+
+// ==================== FLASH GOMB ====================
+
+void checkFlashButton() {
+  int reading = digitalRead(FLASH_BTN_PIN);
+  if (reading != btnLastReading) {
+    btnLastChange = millis();
+    btnLastReading = reading;
+  }
+  if ((millis() - btnLastChange) > 50) {
+    // Stabil állapot
+    if (btnStableState == HIGH && reading == LOW) {
+      // Nyomáskor (fél él)
+      wakeOled();
+      Serial.println("FLASH gomb -> OLED wake");
+    }
+    btnStableState = reading;
+  }
+}
+
+// ==================== SEGÉDFUNKCIÓK ====================
+
+// Egy zóna ütemezéseinek száma
+int countSchedules(int zoneIdx) {
+  int cnt = 0;
+  for (int s = 0; s < MAX_SCHEDULES; s++) {
+    if (zones[zoneIdx].schedules[s].enabled) cnt++;
+  }
+  return cnt;
+}
+
+// Következő ütemezés ideje (HH:MM string) vagy "---"
+String nextScheduleTime(int zoneIdx) {
+  if (!ntpSynced) {
+    // NTP nélkül csak az első ütemezést mutatjuk
+    for (int s = 0; s < MAX_SCHEDULES; s++) {
+      if (zones[zoneIdx].schedules[s].enabled) {
+        char buf[6];
+        sprintf(buf, "%02d:%02d", zones[zoneIdx].schedules[s].hour, zones[zoneIdx].schedules[s].min);
+        return String(buf);
+      }
+    }
+    return "---";
+  }
+  
+  time_t now = time(nullptr);
+  struct tm *tm = localtime(&now);
+  int curMin = tm->tm_hour * 60 + tm->tm_min;
+  
+  int bestMin = 24 * 60;  // holnap
+  bool found = false;
+  
+  for (int s = 0; s < MAX_SCHEDULES; s++) {
+    if (!zones[zoneIdx].schedules[s].enabled) continue;
+    int schedMin = zones[zoneIdx].schedules[s].hour * 60 + zones[zoneIdx].schedules[s].min;
+    if (schedMin >= curMin && schedMin < bestMin) {
+      bestMin = schedMin;
+      found = true;
+    }
+  }
+  
+  // Ha nincs ma már több, holnap az első
+  if (!found) {
+    for (int s = 0; s < MAX_SCHEDULES; s++) {
+      if (!zones[zoneIdx].schedules[s].enabled) continue;
+      int schedMin = zones[zoneIdx].schedules[s].hour * 60 + zones[zoneIdx].schedules[s].min;
+      if (schedMin < bestMin) {
+        bestMin = schedMin;
+        found = true;
+      }
+    }
+  }
+  
+  if (found) {
+    char buf[6];
+    sprintf(buf, "%02d:%02d", bestMin / 60, bestMin % 60);
+    return String(buf);
+  }
+  return "---";
+}
+
+// ==================== OLED ====================
 
 void updateOled() {
   if (!oledPresent) return;
@@ -147,7 +282,7 @@ void updateOled() {
   // Oldalváltás 5 másodpercenként
   unsigned long now = millis();
   if (now - lastPageSwitch > 5000) {
-    oledPage = (oledPage + 1) % 2;
+    oledPage = (oledPage + 1) % 3;
     lastPageSwitch = now;
   }
   
@@ -155,7 +290,6 @@ void updateOled() {
   
   if (oledPage == 0) {
     // === 1. OLDAL: STÁTUSZ (4 zóna kompakt) ===
-    // Sárga sáv (y=0-15): "idő" + pontos idő — size 2 (12x16px)
     display.setTextSize(2);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
@@ -166,7 +300,6 @@ void updateOled() {
       struct tm *tm = localtime(&t);
       char timeBuf[6];
       sprintf(timeBuf, "%02d:%02d", tm->tm_hour, tm->tm_min);
-      // "ido " = 4×12 = 48px, idő = 5×12 = 60px, össz = 108px x=48-tól → 108
       display.setCursor(48, 0);
       display.print(timeBuf);
     } else {
@@ -174,12 +307,11 @@ void updateOled() {
       display.print("--:--");
     }
     
-    // Kék sáv (y=16-63): 4 zóna kompakt
     display.drawLine(0, 16, 128, 16, SSD1306_WHITE);
-    display.setTextSize(1);  // vissza size 1 a kék sávba
+    display.setTextSize(1);
     
     for (int i = 0; i < NUM_ZONES; i++) {
-      int y = 18 + i * 11;  // 18, 29, 40, 51
+      int y = 18 + i * 11;
       display.setCursor(0, y);
       char label[6];
       sprintf(label, "Z%d:", i + 1);
@@ -197,10 +329,11 @@ void updateOled() {
         display.print("OFF");
       }
       
-      // Ütemezés jobb oldalon
-      if (zones[i].scheduled) {
+      // Ütemezés: count + next time
+      int schedCnt = countSchedules(i);
+      if (schedCnt > 0) {
         char sched[16];
-        sprintf(sched, "%02d:%02d %dp", zones[i].schedHour, zones[i].schedMin, zones[i].schedDuration);
+        sprintf(sched, "%dx %s", schedCnt, nextScheduleTime(i).c_str());
         display.setCursor(60, y);
         display.print(sched);
       } else {
@@ -209,9 +342,8 @@ void updateOled() {
       }
     }
     
-  } else {
+  } else if (oledPage == 1) {
     // === 2. OLDAL: RENDSZER INFO ===
-    // Sárga sáv: WiFi — size 2 (rövidítve)
     display.setTextSize(2);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
@@ -220,7 +352,7 @@ void updateOled() {
     display.print(wifiConnected ? "OK" : "X");
     
     display.drawLine(0, 16, 128, 16, SSD1306_WHITE);
-    display.setTextSize(1);  // vissza size 1 a kék sávba
+    display.setTextSize(1);
     display.setCursor(0, 20);
     display.print("IP: " + WiFi.localIP().toString());
     
@@ -245,27 +377,62 @@ void updateOled() {
       display.print(String((int)dhtTemp) + "C " + String((int)dhtHum) + "% ");
     }
     display.print(currentVersion);
+    
+  } else {
+    // === 3. OLDAL: ÜTEMEZÉS ÖSSZEGZÉS ===
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Utem");
+    
+    display.drawLine(0, 16, 128, 16, SSD1306_WHITE);
+    display.setTextSize(1);
+    
+    for (int i = 0; i < NUM_ZONES; i++) {
+      int y = 20 + i * 11;
+      display.setCursor(0, y);
+      char label[8];
+      sprintf(label, "Z%d:", i + 1);
+      display.print(label);
+      
+      int cnt = countSchedules(i);
+      if (cnt > 0) {
+        // Listázza az időpontokat kompakt
+        display.setCursor(20, y);
+        String times = "";
+        for (int s = 0; s < MAX_SCHEDULES; s++) {
+          if (!zones[i].schedules[s].enabled) continue;
+          char tbuf[8];
+          sprintf(tbuf, "%02d:%02d", zones[i].schedules[s].hour, zones[i].schedules[s].min);
+          if (times.length() > 0) times += " ";
+          times += tbuf;
+        }
+        // Csonkítás ha túl hosszú
+        if (times.length() > 17) times = times.substring(0, 17);
+        display.print(times);
+      } else {
+        display.setCursor(20, y);
+        display.print("nincs");
+      }
+    }
   }
   
   // Oldalszám jelzés (jobb alsó sarok)
-  if (oledPage == 0) {
-    display.fillRect(124, 62, 4, 1, SSD1306_WHITE);
-  } else {
-    display.fillRect(120, 62, 4, 1, SSD1306_WHITE);
-    display.fillRect(124, 62, 4, 1, SSD1306_WHITE);
+  for (int p = 0; p <= oledPage; p++) {
+    display.fillRect(120 + p * 4, 62, 4, 1, SSD1306_WHITE);
   }
   
   display.display();
 }
 
+// ==================== TELEGRAM ====================
+
 void sendTelegram(const String &msg, bool adminOnly = false) {
-  // Admin bot — ha hibázik, SSL kliens reset
   if (!botAdmin.sendMessage(ADMIN_CHAT_ID, msg, "")) {
     Serial.println("sendTelegram: admin bot HIBA, SSL reset");
     securedClient.stop();
     delay(100);
     securedClient.setInsecure();
-    // Próbálja újra
     botAdmin.sendMessage(ADMIN_CHAT_ID, msg, "");
   }
   if (!adminOnly) {
@@ -279,6 +446,8 @@ void sendTelegram(const String &msg, bool adminOnly = false) {
   }
   ESP.wdtFeed();
 }
+
+// ==================== BLYNK ====================
 
 void updateBlynkStatus() {
   Blynk.virtualWrite(VPIN_ZONE1, zones[0].active ? 1 : 0);
@@ -295,10 +464,10 @@ void updateBlynkStatus() {
   for (int i = 0; i < NUM_ZONES; i++) {
     if (i > 0) sched += " | ";
     sched += "Z" + String(i + 1) + ":";
-    if (zones[i].scheduled) {
-      sched += String(zones[i].schedHour) + ":" + 
-               (zones[i].schedMin < 10 ? "0" : "") + String(zones[i].schedMin) + 
-               " " + String(zones[i].schedDuration) + "p";
+    int cnt = countSchedules(i);
+    if (cnt > 0) {
+      sched += String(cnt) + "x ";
+      sched += nextScheduleTime(i);
     } else {
       sched += "---";
     }
@@ -306,14 +475,19 @@ void updateBlynkStatus() {
   Blynk.virtualWrite(VPIN_SCHEDULE, sched);
 }
 
+// ==================== ÜTEMEZÉS MENTÉS/BETÖLTÉS ====================
+
 void saveSchedule() {
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   for (int i = 0; i < NUM_ZONES; i++) {
-    JsonObject z = doc.createNestedObject("z" + String(i));
-    z["sched"]  = zones[i].scheduled;
-    z["hour"]   = zones[i].schedHour;
-    z["min"]    = zones[i].schedMin;
-    z["dur"]    = zones[i].schedDuration;
+    JsonArray arr = doc.createNestedArray("z" + String(i));
+    for (int s = 0; s < MAX_SCHEDULES; s++) {
+      JsonObject sch = arr.createNestedObject();
+      sch["e"] = zones[i].schedules[s].enabled ? 1 : 0;
+      sch["h"] = zones[i].schedules[s].hour;
+      sch["m"] = zones[i].schedules[s].min;
+      sch["d"] = zones[i].schedules[s].duration;
+    }
   }
   File f = LittleFS.open("/schedule.json", "w");
   serializeJson(doc, f);
@@ -323,18 +497,43 @@ void saveSchedule() {
 void loadSchedule() {
   File f = LittleFS.open("/schedule.json", "r");
   if (!f) return;
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   DeserializationError err = deserializeJson(doc, f);
   f.close();
   if (err) return;
+  
   for (int i = 0; i < NUM_ZONES; i++) {
-    JsonObject z = doc["z" + String(i)];
-    zones[i].scheduled    = z["sched"] | false;
-    zones[i].schedHour     = z["hour"] | 6;
-    zones[i].schedMin      = z["min"] | 30;
-    zones[i].schedDuration = z["dur"] | 10;
+    String key = "z" + String(i);
+    JsonVariant val = doc[key];
+    
+    if (val.is<JsonArray>()) {
+      // Új formátum: ütemezések tömbje
+      JsonArray arr = val.as<JsonArray>();
+      for (int s = 0; s < MAX_SCHEDULES && s < (int)arr.size(); s++) {
+        zones[i].schedules[s].enabled  = arr[s]["e"] | 0;
+        zones[i].schedules[s].hour     = arr[s]["h"] | 0;
+        zones[i].schedules[s].min      = arr[s]["m"] | 0;
+        zones[i].schedules[s].duration = arr[s]["d"] | 0;
+      }
+    } else if (val.is<JsonObject>()) {
+      // Régi formátum (v1.0.x): egyetlen ütemezés
+      JsonObject obj = val.as<JsonObject>();
+      zones[i].schedules[0].enabled  = obj["sched"] | false;
+      zones[i].schedules[0].hour     = obj["hour"] | 6;
+      zones[i].schedules[0].min      = obj["min"] | 30;
+      zones[i].schedules[0].duration = obj["dur"] | 10;
+      for (int s = 1; s < MAX_SCHEDULES; s++) {
+        zones[i].schedules[s].enabled = false;
+        zones[i].schedules[s].hour = 0;
+        zones[i].schedules[s].min = 0;
+        zones[i].schedules[s].duration = 0;
+      }
+    }
   }
+  Serial.println("Ütemezés betöltve (v1.1.0 formátum)");
 }
+
+// ==================== ZÓNA VEZÉRLÉS ====================
 
 void startZone(int zoneIdx, int minutes) {
   if (zoneIdx < 0 || zoneIdx >= NUM_ZONES) return;
@@ -347,6 +546,7 @@ void startZone(int zoneIdx, int minutes) {
                String(minutes) + " perc)";
   sendTelegram(msg);
   updateBlynkStatus();
+  wakeOled();
 }
 
 void stopZone(int zoneIdx) {
@@ -357,6 +557,7 @@ void stopZone(int zoneIdx) {
   String msg = "✅ Zone " + String(zoneIdx + 1) + " LEALLITVA";
   sendTelegram(msg);
   updateBlynkStatus();
+  wakeOled();
 }
 
 void stopAllZones() {
@@ -384,20 +585,24 @@ void checkSchedule() {
   int curHour = tm->tm_hour;
   int curMin  = tm->tm_min;
   
-  // csak egész percenként ellenőriz (ne többször触发)
   static int lastCheckedMinute = -1;
   if (lastCheckedMinute == curMin) return;
   lastCheckedMinute = curMin;
   
   for (int i = 0; i < NUM_ZONES; i++) {
-    if (zones[i].scheduled && 
-        zones[i].schedHour == curHour && 
-        zones[i].schedMin == curMin &&
-        !zones[i].active) {
-      startZone(i, zones[i].schedDuration);
+    if (zones[i].active) continue;
+    for (int s = 0; s < MAX_SCHEDULES; s++) {
+      if (zones[i].schedules[s].enabled &&
+          zones[i].schedules[s].hour == curHour &&
+          zones[i].schedules[s].min == curMin) {
+        startZone(i, zones[i].schedules[s].duration);
+        break;
+      }
     }
   }
 }
+
+// ==================== NTP ====================
 
 void syncNTP(bool silent = false) {
   Serial.println("NTP szinkron...");
@@ -418,6 +623,8 @@ void syncNTP(bool silent = false) {
   Serial.println("\nNTP SIKERTELEN!");
   ntpSynced = false;
 }
+
+// ==================== FIRMWARE ====================
 
 void checkFirmware() {
   Serial.println("FW check indul...");
@@ -559,10 +766,17 @@ String getStatusText() {
              String(remaining % 60) + "mp)";
     }
     txt += "\n";
-    if (zones[i].scheduled) {
-      txt += "  ⏰ " + String(zones[i].schedHour) + ":" + 
-             (zones[i].schedMin < 10 ? "0" : "") + String(zones[i].schedMin) + 
-             " (" + String(zones[i].schedDuration) + "p)\n";
+    int cnt = countSchedules(i);
+    if (cnt > 0) {
+      for (int s = 0; s < MAX_SCHEDULES; s++) {
+        if (!zones[i].schedules[s].enabled) continue;
+        txt += "  ⏰ *" + String(s + 1) + ":* " + 
+               String(zones[i].schedules[s].hour) + ":" + 
+               (zones[i].schedules[s].min < 10 ? "0" : "") + String(zones[i].schedules[s].min) + 
+               " (" + String(zones[i].schedules[s].duration) + "p)\n";
+      }
+    } else {
+      txt += "  ⏰ nincs ütemezés\n";
     }
   }
   time_t now = time(nullptr);
@@ -577,7 +791,7 @@ String getStatusText() {
     txt += "🌡 " + String((int)dhtTemp) + "°C  💧" + String((int)dhtHum) + "%\n";
   }
   uint32_t freeHeap = ESP.getFreeHeap();
-  uint32_t totalHeap = 81920;  // ESP8266 fix 80KB heap
+  uint32_t totalHeap = 81920;
   txt += "Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
   unsigned long secs = millis() / 1000;
   txt += "Uptime: " + String(secs / 3600) + "ó " + String((secs % 3600) / 60) + "p";
@@ -595,9 +809,12 @@ String getHelpText(bool isAdmin) {
   h += "/schedule — Ütemezés lekérdezése\n";
   if (isAdmin) {
     h += "\n*Admin:*\n";
-    h += "/set <zone> <ora> <perc> <dur> — Ütemezés\n";
-    h += "  pl: /set 1 06 30 10\n";
-    h += "/clear <zone> — Ütemezés törlése\n";
+    h += "/set <zone> <slot> <ora> <perc> <dur>\n";
+    h += "  pl: /set 1 1 06 30 10\n";
+    h += "  zone: 1-4, slot: 1-4\n";
+    h += "/clear <zone> [slot] — Ütemezés törlése\n";
+    h += "  pl: /clear 1 (összes slot)\n";
+    h += "  pl: /clear 1 2 (csak slot 2)\n";
     h += "/upgrade — Firmware frissítés\n";
     h += "/reboot — Újraindítás\n";
   }
@@ -608,6 +825,8 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
   Serial.println("CMD: [" + chatId + "] " + text);
   text.trim();
   text.toLowerCase();
+  
+  wakeOled(); // Parancs érkezett — OLED ébresztés
   
   if (text == "/help" || text == "/start") {
     bot.sendMessage(chatId, getHelpText(isAdmin), "Markdown");
@@ -641,15 +860,20 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
   }
   
   if (text == "/schedule") {
-    String s = "⏰ *Ütemezés (4 zóna)*\n\n";
+    String s = "⏰ *Ütemezés (4 zóna, max 4/zóna)*\n\n";
     for (int i = 0; i < NUM_ZONES; i++) {
-      s += "*Zone " + String(i + 1) + ":* ";
-      if (zones[i].scheduled) {
-        s += String(zones[i].schedHour) + ":" + 
-              (zones[i].schedMin < 10 ? "0" : "") + String(zones[i].schedMin) + 
-              " (" + String(zones[i].schedDuration) + "p)\n";
+      s += "*Zone " + String(i + 1) + ":*\n";
+      int cnt = countSchedules(i);
+      if (cnt > 0) {
+        for (int sc = 0; sc < MAX_SCHEDULES; sc++) {
+          if (!zones[i].schedules[sc].enabled) continue;
+          s += "  " + String(sc + 1) + ": " + 
+               String(zones[i].schedules[sc].hour) + ":" + 
+               (zones[i].schedules[sc].min < 10 ? "0" : "") + String(zones[i].schedules[sc].min) + 
+               " (" + String(zones[i].schedules[sc].duration) + "p)\n";
+        }
       } else {
-        s += "nincs\n";
+        s += "  nincs\n";
       }
     }
     bot.sendMessage(chatId, s, "Markdown");
@@ -661,48 +885,79 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     return;
   }
   
+  // /set <zone> <slot> <ora> <perc> <dur>
   if (text.startsWith("/set")) {
-    int sp1 = text.indexOf(' ');
-    int sp2 = text.indexOf(' ', sp1 + 1);
-    int sp3 = text.indexOf(' ', sp2 + 1);
-    int sp4 = text.indexOf(' ', sp3 + 1);
-    if (sp1 > 0 && sp2 > 0 && sp3 > 0 && sp4 > 0) {
-      int z = text.substring(sp1 + 1, sp2).toInt() - 1;
-      int h = text.substring(sp2 + 1, sp3).toInt();
-      int m = text.substring(sp3 + 1, sp4).toInt();
-      int d = text.substring(sp4 + 1).toInt();
-      if (z >= 0 && z < NUM_ZONES && h >= 0 && h <= 23 && m >= 0 && m <= 59 && d > 0) {
-        zones[z].scheduled = true;
-        zones[z].schedHour = h;
-        zones[z].schedMin = m;
-        zones[z].schedDuration = d;
+    // 5 paraméter: zone slot hour min dur
+    int sp[5];
+    sp[0] = text.indexOf(' ');                    // after /set
+    sp[1] = text.indexOf(' ', sp[0] + 1);         // after zone
+    sp[2] = text.indexOf(' ', sp[1] + 1);         // after slot
+    sp[3] = text.indexOf(' ', sp[2] + 1);         // after hour
+    sp[4] = text.indexOf(' ', sp[3] + 1);         // after min
+    
+    if (sp[0] > 0 && sp[1] > 0 && sp[2] > 0 && sp[3] > 0 && sp[4] > 0) {
+      int z  = text.substring(sp[0] + 1, sp[1]).toInt() - 1;    // zone 0-3
+      int sl = text.substring(sp[1] + 1, sp[2]).toInt() - 1;    // slot 0-3
+      int h  = text.substring(sp[2] + 1, sp[3]).toInt();        // hour
+      int m  = text.substring(sp[3] + 1, sp[4]).toInt();        // min
+      int d  = text.substring(sp[4] + 1).toInt();               // duration
+      
+      if (z >= 0 && z < NUM_ZONES && sl >= 0 && sl < MAX_SCHEDULES && 
+          h >= 0 && h <= 23 && m >= 0 && m <= 59 && d > 0) {
+        zones[z].schedules[sl].enabled  = true;
+        zones[z].schedules[sl].hour     = h;
+        zones[z].schedules[sl].min      = m;
+        zones[z].schedules[sl].duration = d;
         saveSchedule();
-        String msg = "✅ Zone " + String(z + 1) + " ütemezve: " + 
-                     String(h) + ":" + (m < 10 ? "0" : "") + String(m) + 
+        String msg = "✅ Zone " + String(z + 1) + " slot " + String(sl + 1) + 
+                     " ütemezve: " + String(h) + ":" + (m < 10 ? "0" : "") + String(m) + 
                      " (" + String(d) + " perc)";
         sendTelegram(msg);
         updateBlynkStatus();
         return;
       }
     }
-    bot.sendMessage(chatId, "Használat: /set <zone> <ora> <perc> <dur>\npl: /set 1 06 30 10\nZónák: 1-4", "");
+    bot.sendMessage(chatId, "Használat: /set <zone> <slot> <ora> <perc> <dur>\n"
+                            "pl: /set 1 1 06 30 10\n"
+                            "zone: 1-4, slot: 1-4", "");
     return;
   }
   
+  // /clear <zone> [slot]
   if (text.startsWith("/clear")) {
-    int sp = text.indexOf(' ');
-    if (sp > 0) {
-      int z = text.substring(sp + 1).toInt() - 1;
+    int sp1 = text.indexOf(' ');
+    if (sp1 > 0) {
+      int sp2 = text.indexOf(' ', sp1 + 1);
+      int z = text.substring(sp1 + 1, sp2 > 0 ? sp2 : text.length()).toInt() - 1;
       if (z >= 0 && z < NUM_ZONES) {
-        zones[z].scheduled = false;
-        saveSchedule();
-        String msg = "🗑️ Zone " + String(z + 1) + " ütemezés törölve";
-        sendTelegram(msg);
-        updateBlynkStatus();
-        return;
+        if (sp2 > 0) {
+          // Specific slot
+          int sl = text.substring(sp2 + 1).toInt() - 1;
+          if (sl >= 0 && sl < MAX_SCHEDULES) {
+            zones[z].schedules[sl].enabled = false;
+            saveSchedule();
+            String msg = "🗑️ Zone " + String(z + 1) + " slot " + String(sl + 1) + " törölve";
+            sendTelegram(msg);
+            updateBlynkStatus();
+            return;
+          }
+        } else {
+          // All slots for this zone
+          for (int s = 0; s < MAX_SCHEDULES; s++) {
+            zones[z].schedules[s].enabled = false;
+          }
+          saveSchedule();
+          String msg = "🗑️ Zone " + String(z + 1) + " összes ütemezés törölve";
+          sendTelegram(msg);
+          updateBlynkStatus();
+          return;
+        }
       }
     }
-    bot.sendMessage(chatId, "Használat: /clear <zone>\npl: /clear 1\nZónák: 1-4", "");
+    bot.sendMessage(chatId, "Használat: /clear <zone> [slot]\n"
+                            "pl: /clear 1 (összes)\n"
+                            "pl: /clear 1 2 (csak slot 2)\n"
+                            "zone: 1-4, slot: 1-4", "");
     return;
   }
   
@@ -724,7 +979,6 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
 void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool isAdmin) {
   int numNew = bot.getUpdates(bot.last_message_received + 1);
   if (numNew < 0) {
-    // Hiba — SSL kliens reset
     Serial.println("Bot poll HIBA, SSL reset");
     client.stop();
     delay(100);
@@ -745,24 +999,28 @@ void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool 
 // ==================== BLYNK HANDLERS ====================
 
 BLYNK_WRITE(VPIN_ZONE1) {
+  wakeOled();
   int state = param.asInt();
   if (state) startZone(0, 10);
   else stopZone(0);
 }
 
 BLYNK_WRITE(VPIN_ZONE2) {
+  wakeOled();
   int state = param.asInt();
   if (state) startZone(1, 10);
   else stopZone(1);
 }
 
 BLYNK_WRITE(VPIN_ZONE3) {
+  wakeOled();
   int state = param.asInt();
   if (state) startZone(2, 10);
   else stopZone(2);
 }
 
 BLYNK_WRITE(VPIN_ZONE4) {
+  wakeOled();
   int state = param.asInt();
   if (state) startZone(3, 10);
   else stopZone(3);
@@ -777,12 +1035,15 @@ void setup() {
   // Relé pin-ek — aktív magas, boot-kor LOW (ki)
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
-  pinMode(RELAY3_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);  // D0/GPIO16 (áthelyezve D3-ról)
   pinMode(RELAY4_PIN, OUTPUT);
   digitalWrite(RELAY1_PIN, RELAY_OFF);
   digitalWrite(RELAY2_PIN, RELAY_OFF);
   digitalWrite(RELAY3_PIN, RELAY_OFF);
   digitalWrite(RELAY4_PIN, RELAY_OFF);
+  
+  // FLASH gomb (GPIO0/D3) — input, beépített pull-up
+  pinMode(FLASH_BTN_PIN, INPUT_PULLUP);
   
   // LittleFS
   LittleFS.begin();
@@ -797,9 +1058,10 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("Ontozes Vezerles");
-    display.println("Booting...");
+    display.println("v1.1.0 Booting...");
     display.display();
     Serial.println("OLED OK");
+    lastActivity = millis();  // OLED ébren boot után
   } else {
     oledPresent = false;
     Serial.println("OLED nem talalhato! (0x3C/0x3D)");
@@ -824,7 +1086,6 @@ void setup() {
     Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
   } else {
     Serial.println("\nWiFi sikertelen! Watchdog újraindítja.");
-    // WDT reset lesz
   }
   
   // TLS
@@ -833,7 +1094,6 @@ void setup() {
   
   // Blynk
   Blynk.config(BLYNK_AUTH_TOKEN);
-  // Nem blokkoló — Blynk.run() kezeli a csatlakozást
   
   // NTP
   syncNTP();
@@ -845,8 +1105,6 @@ void setup() {
   
   // Boot üzenet
   if (wifiConnected) {
-    // Régi Telegram üzenetek ürítése — offset a legutolsó update utáni pozícióra állít
-    // getUpdates(-1) = az összes régi üzenetet üríti, nem dolgozza fel
     int n1 = botAdmin.getUpdates(0);
     while (n1) {
       n1 = botAdmin.getUpdates(botAdmin.last_message_received + 1);
@@ -868,17 +1126,23 @@ void setup() {
   // Első OLED frissítés
   updateOled();
   
-  Serial.println("Setup kész!");
+  Serial.println("Setup kész! (v1.1.0)");
 }
 
 void loop() {
-  ESP.wdtFeed(); // Watchdog etetés
+  ESP.wdtFeed();
   
   // Blynk futás
   if (wifiConnected) {
     Blynk.run();
   }
   blynkTimer.run();
+  
+  // FLASH gomb ellenőrzés (OLED ébresztés)
+  checkFlashButton();
+  
+  // OLED sleep ellenőrzés
+  checkOledSleep();
   
   // Telegram bot poll (1 másodpercenként)
   unsigned long now = millis();
@@ -890,16 +1154,16 @@ void loop() {
     }
   }
   
-  // Futó zónák ellenőrzése (ms-onként)
+  // Futó zónák ellenőrzése
   checkRunningZones();
   
-  // Ütemezés ellenőrzése (1 másodpercenként elég)
+  // Ütemezés ellenőrzése (1 másodpercenként)
   if (now - lastScheduleCheck > 1000) {
     lastScheduleCheck = now;
     checkSchedule();
   }
   
-  // NTP újracsatlakozás (1 óránként, csendesen — csak boot-nál küld Telegramot)
+  // NTP újracsatlakozás (1 óránként, csendesen)
   if (now - lastNtpSync > 3600000) {
     lastNtpSync = now;
     if (wifiConnected) syncNTP(true);
@@ -925,8 +1189,8 @@ void loop() {
     if (wifiConnected) checkFirmware();
   }
   
-  // OLED frissítés (1 másodpercenként)
-  if (now - lastOledUpdate > 1000) {
+  // OLED frissítés (1 másodpercenként) — csak ha nem alszik
+  if (oledPresent && !oledSleeping && now - lastOledUpdate > 1000) {
     lastOledUpdate = now;
     updateOled();
   }
