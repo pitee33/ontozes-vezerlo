@@ -120,10 +120,10 @@ unsigned long lastPageSwitch = 0;
 bool oledSleeping = false;
 unsigned long lastActivity = 0;
 
-// FLASH gomb debounce
-int btnStableState = HIGH;
-int btnLastReading = HIGH;
-unsigned long btnLastChange = 0;
+// FLASH gomb — egyszerű lenyomás érzékelés cooldown-nal
+bool btnWasPressed = false;
+unsigned long lastBtnDebug = 0;
+int lastDbgState = -999;
 
 #define NUM_ZONES 4
 
@@ -198,18 +198,25 @@ void checkOledSleep() {
 
 void checkFlashButton() {
   int reading = digitalRead(FLASH_BTN_PIN);
-  if (reading != btnLastReading) {
-    btnLastChange = millis();
-    btnLastReading = reading;
-  }
-  if ((millis() - btnLastChange) > 50) {
-    // Stabil állapot
-    if (btnStableState == HIGH && reading == LOW) {
-      // Nyomáskor (fél él)
-      wakeOled();
-      Serial.println("FLASH gomb -> OLED wake");
+  
+  // Debug: kiírja a pin állapotát 2 másodpercenként
+  unsigned long now = millis();
+  if (now - lastBtnDebug > 2000) {
+    lastBtnDebug = now;
+    if (reading != lastDbgState) {
+      Serial.printf("FLASH pin state: %d (sleeping=%d)\n", reading, oledSleeping);
+      lastDbgState = reading;
     }
-    btnStableState = reading;
+  }
+  
+  // Él detektálás: HIGH→LOW = gomb lenyomva
+  if (reading == LOW && !btnWasPressed) {
+    btnWasPressed = true;
+    wakeOled();
+    Serial.println("FLASH gomb LENYOMVA -> OLED wake");
+  }
+  if (reading == HIGH) {
+    btnWasPressed = false;
   }
 }
 
