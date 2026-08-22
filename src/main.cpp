@@ -89,9 +89,17 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.1.0"
+#define FIRMWARE_VERSION  "1.2.0"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
+
+// Időjárás (Open-Meteo — HTTP, ingyenes, nem kell API kulcs)
+// Törökbálint: 47.28°N, 18.92°E
+#define WEATHER_URL "http://api.open-meteo.com/v1/forecast?latitude=47.28&longitude=18.92&daily=precipitation_sum,precipitation_probability_max&timezone=Europe/Budapest&forecast_days=1"
+#define WEATHER_CHECK_MS 1800000UL  // 30 perc
+#define RAIN_THRESHOLD_MM 1.0      // >1mm eső = esős nap
+#define RAIN_THRESHOLD_PROB 50     // >50% valószínűség = esős
+#define WATER_TIMEOUT_MS 600000UL  // 10 perc válasz nélkül → auto öntöz
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -164,6 +172,7 @@ unsigned long lastScheduleCheck = 0;
 unsigned long lastFirmwareCheck = 0;
 unsigned long lastBlynkUpdate = 0;
 unsigned long lastNtpSync = 0;
+unsigned long lastWeatherCheck = 0;
 
 bool wifiConnected = false;
 bool ntpSynced = false;
@@ -174,6 +183,24 @@ DHT dht(DHT_PIN, DHT_TYPE);
 float dhtTemp = NAN;
 float dhtHum = NAN;
 unsigned long lastDhtRead = 0;
+
+// ==================== IDŐJÁRÁS ====================
+
+// Időjárás adatok
+float todayRainMm = 0.0;       // Mai eső mennyiség (mm)
+int todayRainProb = 0;         // Mai eső valószínűség (%)
+bool weatherChecked = false;   // Sikerült-e lekérni
+bool isRainyDay = false;        // Esős nap-e
+
+// Pending locsolás kérdés (inline gombos)
+struct PendingWater {
+  bool active;                 // Van folyamatban lévő kérdés?
+  int zoneIdx;                 // Melyik zóna
+  int duration;                // Hány perc
+  int schedSlot;               // Melyik slot indította
+  unsigned long askTime;       // Mikor tettük fel a kérdést
+};
+PendingWater pendingWater = { false, 0, 0, 0, 0 };
 
 // ==================== OLED SLEEP / WAKE ====================
 
@@ -207,6 +234,10 @@ void checkOledSleep() {
     Serial.println("OLED sleep (inaktivitas) + LED ki");
   }
 }
+
+// Forward declaration
+void askWaterQuestion(int zoneIdx, int duration, int schedSlot);
+void handleCallbackQuery(String callbackData, String chatId, String messageId);
 
 // ==================== FLASH GOMB ====================
 
@@ -622,10 +653,144 @@ void checkSchedule() {
       if (zones[i].schedules[s].enabled &&
           zones[i].schedules[s].hour == curHour &&
           zones[i].schedules[s].min == curMin) {
-        startZone(i, zones[i].schedules[s].duration);
+        // Időjárás-alapú locsolás: esős nap → kérdez
+        askWaterQuestion(i, zones[i].schedules[s].duration, s);
         break;
       }
     }
+  }
+}
+
+// ==================== IDŐJÁRÁS (Open-Meteo) ====================
+
+void checkWeather() {
+  if (!wifiConnected) return;
+  
+  Serial.println("Időjárás lekérés (Open-Meteo)...");
+  WiFiClient client;
+  HTTPClient http;
+  http.begin(client, WEATHER_URL);
+  http.setTimeout(10000);
+  int code = http.GET();
+  Serial.println("Weather HTTP code: " + String(code));
+  
+  if (code != HTTP_CODE_OK) {
+    Serial.println("Weather HIBA: " + http.errorToString(code));
+    http.end();
+    return;
+  }
+  
+  String response = http.getString();
+  http.end();
+  
+  // JSON parse — Open-Meteo válasz:
+  // {"daily":{"time":["2024-01-01"],"precipitation_sum":[0.0],"precipitation_probability_max":[20]}}
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    Serial.println("Weather JSON HIBA: " + String(err.c_str()));
+    return;
+  }
+  
+  JsonObject daily = doc["daily"];
+  if (daily.isNull()) {
+    Serial.println("Weather: nincs daily objektum");
+    return;
+  }
+  
+  JsonArray precipSum = daily["precipitation_sum"];
+  JsonArray precipProb = daily["precipitation_probability_max"];
+  
+  if (precipSum.isNull() || precipProb.isNull()) {
+    Serial.println("Weather: nincs precipitation adat");
+    return;
+  }
+  
+  todayRainMm = precipSum[0].as<float>();
+  todayRainProb = precipProb[0].as<int>();
+  weatherChecked = true;
+  
+  // Esős nap ha >1mm eső vagy >50% valószínűség
+  isRainyDay = (todayRainMm >= RAIN_THRESHOLD_MM || todayRainProb >= RAIN_THRESHOLD_PROB);
+  
+  Serial.printf("Weather: %.1fmm, %d%% prob -> %s\n", 
+                todayRainMm, todayRainProb, isRainyDay ? "ESŐS" : "száraz");
+}
+
+// ==================== LOC SOLÁS KÉRDÉS ====================
+
+// Inline keyboard a locsolás kérdéshez
+String waterKeyboardJson() {
+  String kb = "{\"inline_keyboard\":[[{\"text\":\"💧 Öntöz\",\"callback_data\":\"water_yes\"},{\"text\":\"🌧 Kihagy\",\"callback_data\":\"water_no\"}]]}";
+  return kb;
+}
+
+// Kérdés felvétele: esős nap + ütemezett locsolás előtt
+void askWaterQuestion(int zoneIdx, int duration, int schedSlot) {
+  if (!weatherChecked || !isRainyDay) {
+    // Nem esős — simán öntöz
+    startZone(zoneIdx, duration);
+    return;
+  }
+  
+  // Esős nap — kérdezz
+  pendingWater.active = true;
+  pendingWater.zoneIdx = zoneIdx;
+  pendingWater.duration = duration;
+  pendingWater.schedSlot = schedSlot;
+  pendingWater.askTime = millis();
+  
+  String msg = "🌧 *Esős nap van!*\n";
+  msg += "Előrejelzés: " + String(todayRainMm, 1) + "mm eső, ";
+  msg += String(todayRainProb) + "% valószínűség\n\n";
+  msg += "*Zone " + String(zoneIdx + 1) + "* ütemezett öntözés: ";
+  msg += String(duration) + " perc\n\n";
+  msg += "Szükséges a locsolás?";
+  
+  // Admin bot küld inline gombbal
+  bool ok = botAdmin.sendMessageWithInlineKeyboard(ADMIN_CHAT_ID, msg, "Markdown", waterKeyboardJson());
+  if (!ok) {
+    Serial.println("Water question küldés HIBA — auto öntöz");
+    pendingWater.active = false;
+    startZone(zoneIdx, duration);
+  }
+  Serial.println("Water question elküldve (Z" + String(zoneIdx + 1) + ")");
+}
+
+// Pending water timeout ellenőrzés (10 perc → auto öntöz)
+void checkPendingWaterTimeout() {
+  if (!pendingWater.active) return;
+  if (millis() - pendingWater.askTime > WATER_TIMEOUT_MS) {
+    Serial.println("Water question timeout — auto öntöz");
+    pendingWater.active = false;
+    startZone(pendingWater.zoneIdx, pendingWater.duration);
+    botAdmin.sendMessage(ADMIN_CHAT_ID, 
+      "⏰ Nincs válasz 10 percig — automatikus öntözés elindítva (Z" + 
+      String(pendingWater.zoneIdx + 1) + ")", "");
+  }
+}
+
+// Callback query kezelése (inline gomb válasz)
+void handleCallbackQuery(String callbackData, String chatId, String messageId) {
+  Serial.println("Callback: " + callbackData + " from " + chatId);
+  
+  if (!pendingWater.active) {
+    botAdmin.sendMessage(chatId, "Ez a kérdés már lejárt.", "");
+    return;
+  }
+  
+  if (callbackData == "water_yes") {
+    int z = pendingWater.zoneIdx;
+    int d = pendingWater.duration;
+    pendingWater.active = false;
+    startZone(z, d);
+    botAdmin.sendMessage(chatId, 
+      "💧 Öntözés elindítva! (Z" + String(z + 1) + ", " + String(d) + "p)", "");
+  } else if (callbackData == "water_no") {
+    int z = pendingWater.zoneIdx;
+    pendingWater.active = false;
+    botAdmin.sendMessage(chatId, 
+      "🌧 Öntözés kihagyva (Z" + String(z + 1) + "). Esős nap van!", "");
   }
 }
 
@@ -827,7 +992,11 @@ String getStatusText() {
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t totalHeap = 81920;
   txt += "Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
-  txt += "Uptime: " + uptimeStr();
+  txt += "Uptime: " + uptimeStr() + "\n";
+  if (weatherChecked) {
+    txt += "🌤 " + String(todayRainMm, 1) + "mm/" + String(todayRainProb) + "% ";
+    txt += isRainyDay ? "(esős)" : "(száraz)";
+  }
   return txt;
 }
 
@@ -852,6 +1021,7 @@ String getHelpText(bool isAdmin) {
     h += "/reboot — Újraindítás\n";
     h += "/flash — FLASH gomb debug\n";
     h += "/wake — OLED ébresztése\n";
+    h += "/weather — Időjárás info\n";
   }
   return h;
 }
@@ -1033,6 +1203,23 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     return;
   }
   
+  // Időjárás info
+  if (text == "/weather" && isAdmin) {
+    // Friss adatok lekérése
+    checkWeather();
+    if (!weatherChecked) {
+      bot.sendMessage(chatId, "❌ Időjárás lekérés sikertelen", "");
+      return;
+    }
+    String msg = "🌤 *Időjárás (Törökbálint)*\n";
+    msg += "Eső ma: " + String(todayRainMm, 1) + " mm\n";
+    msg += "Eső valószínű: " + String(todayRainProb) + "%\n";
+    msg += "Státusz: " + String(isRainyDay ? "🌧 ESŐS nap" : "☀️ Száraz nap") + "\n\n";
+    msg += "Locsolás: " + String(isRainyDay ? "kérdezni fog" : "automatikus");
+    bot.sendMessage(chatId, msg, "Markdown");
+    return;
+  }
+  
   bot.sendMessage(chatId, "Ismeretlen parancs. /help", "");
 }
 
@@ -1049,7 +1236,18 @@ void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool 
     for (int i = 0; i < numNew; i++) {
       String text = bot.messages[i].text;
       String chatId = bot.messages[i].chat_id;
-      handleCommand(bot, text, chatId, isAdmin);
+      String messageType = bot.messages[i].type;
+      
+      // Callback query (inline gomb válasz)
+      if (messageType == "callback_query") {
+        String callbackData = bot.messages[i].text;
+        String messageId = String(bot.messages[i].message_id);
+        Serial.println("Callback: " + callbackData);
+        handleCallbackQuery(callbackData, chatId, messageId);
+      } else {
+        // Normál üzenet
+        handleCommand(bot, text, chatId, isAdmin);
+      }
     }
     ESP.wdtFeed();
     numNew = bot.getUpdates(bot.last_message_received + 1);
@@ -1119,7 +1317,7 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("Ontozes Vezerles");
-    display.println("v1.1.0 Booting...");
+    display.println("v1.2.0 Booting...");
     display.display();
     Serial.println("OLED OK");
     lastActivity = millis();  // OLED ébren boot után
@@ -1187,7 +1385,12 @@ void setup() {
   // Első OLED frissítés
   updateOled();
   
-  Serial.println("Setup kész! (v1.1.0)");
+  // Első időjárás lekérés
+  if (wifiConnected) {
+    checkWeather();
+  }
+  
+  Serial.println("Setup kész! (v1.2.0)");
 }
 
 void loop() {
@@ -1249,6 +1452,15 @@ void loop() {
     lastFirmwareCheck = now;
     if (wifiConnected) checkFirmware();
   }
+  
+  // Időjárás ellenőrzés (30 percenként)
+  if (now - lastWeatherCheck > WEATHER_CHECK_MS) {
+    lastWeatherCheck = now;
+    checkWeather();
+  }
+  
+  // Pending water kérdés timeout (10 perc → auto öntöz)
+  checkPendingWaterTimeout();
   
   // OLED frissítés (1 másodpercenként) — csak ha nem alszik
   if (oledPresent && !oledSleeping && now - lastOledUpdate > 1000) {
