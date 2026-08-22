@@ -727,8 +727,23 @@ String waterKeyboardJson() {
 
 // Kérdés felvétele: esős nap + ütemezett locsolás előtt
 void askWaterQuestion(int zoneIdx, int duration, int schedSlot) {
-  if (!weatherChecked || !isRainyDay) {
+  // Friss időjárás lekérés a döntés előtt — ne 30 perces adatra támasszkodjon
+  Serial.println("Ütemezett öntözés előtt — friss időjárás lekérés...");
+  checkWeather();
+  
+  if (!weatherChecked) {
+    // Időjárás lekérés sikertelen — biztonsági okokból öntöz
+    Serial.println("Weather lekérés sikertelen — auto öntöz (biztonság)");
+    botAdmin.sendMessage(ADMIN_CHAT_ID, 
+      "⚠️ Időjárás lekérés sikertelen, automatikus öntözés (Z" + 
+      String(zoneIdx + 1) + ")", "");
+    startZone(zoneIdx, duration);
+    return;
+  }
+  
+  if (!isRainyDay) {
     // Nem esős — simán öntöz
+    Serial.println("Nem esős nap — auto öntöz");
     startZone(zoneIdx, duration);
     return;
   }
