@@ -281,6 +281,28 @@ String nextScheduleTime(int zoneIdx) {
   return "---";
 }
 
+// Uptime formázott string — nap/hónap bontás
+String uptimeStr() {
+  unsigned long s = millis() / 1000;
+  int days = s / 86400;
+  int hours = (s % 86400) / 3600;
+  int mins = (s % 3600) / 60;
+  int months = days / 30;
+  int remDays = days % 30;
+  
+  String out = "";
+  if (months > 0) {
+    out += String(months) + "ho ";
+    if (remDays > 0) out += String(remDays) + "n ";
+    if (hours > 0) out += String(hours) + "o";
+  } else if (days > 0) {
+    out += String(days) + "n " + String(hours) + "o " + String(mins) + "p";
+  } else {
+    out += String(hours) + "o " + String(mins) + "p";
+  }
+  return out;
+}
+
 // ==================== OLED ====================
 
 void updateOled() {
@@ -375,9 +397,7 @@ void updateOled() {
     }
     
     display.setCursor(0, 40);
-    unsigned long upSec = millis() / 1000;
-    display.print("Up: " + String(upSec / 3600) + "h " + 
-                  String((upSec % 3600) / 60) + "m");
+    display.print("Up: " + uptimeStr());
     
     display.setCursor(0, 50);
     if (!isnan(dhtTemp)) {
@@ -793,15 +813,21 @@ String getStatusText() {
     txt += "\n⚠️ NTP nincs szinkronizálva\n";
   }
   txt += "FW: " + currentVersion + "\n";
-  txt += "WiFi: " + String(WiFi.RSSI()) + " dBm\n";
+  txt += "WiFi: " + String(WiFi.RSSI()) + " dBm";
+  int rssi = WiFi.RSSI();
+  if (rssi >= -55) txt += " (kiváló)";
+  else if (rssi >= -67) txt += " (jó)";
+  else if (rssi >= -78) txt += " (közepes)";
+  else if (rssi >= -85) txt += " (gyenge)";
+  else txt += " (nagyon gyenge)";
+  txt += "\n";
   if (!isnan(dhtTemp)) {
     txt += "🌡 " + String((int)dhtTemp) + "°C  💧" + String((int)dhtHum) + "%\n";
   }
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t totalHeap = 81920;
   txt += "Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
-  unsigned long secs = millis() / 1000;
-  txt += "Uptime: " + String(secs / 3600) + "ó " + String((secs % 3600) / 60) + "p";
+  txt += "Uptime: " + uptimeStr();
   return txt;
 }
 
