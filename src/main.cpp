@@ -99,7 +99,7 @@
 #define WEATHER_CHECK_MS 1800000UL  // 30 perc
 #define RAIN_THRESHOLD_MM 1.0      // >1mm eső = esős nap
 #define RAIN_THRESHOLD_PROB 50     // >50% valószínűség = esős
-#define WATER_TIMEOUT_MS 600000UL  // 10 perc válasz nélkül → auto öntöz
+#define WATER_TIMEOUT_MS 1800000UL  // 30 perc válasz nélkül → auto öntöz
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -432,7 +432,7 @@ void updateOled() {
     
     display.setCursor(0, 50);
     if (!isnan(dhtTemp)) {
-      display.print(String((int)dhtTemp) + "C " + String((int)dhtHum) + "% ");
+      display.print(String((int)dhtTemp) + "C " + String((int)dhtHum) + "% P");
     }
     display.print(currentVersion);
     
@@ -765,7 +765,7 @@ void checkPendingWaterTimeout() {
     pendingWater.active = false;
     startZone(pendingWater.zoneIdx, pendingWater.duration);
     botAdmin.sendMessage(ADMIN_CHAT_ID, 
-      "⏰ Nincs válasz 10 percig — automatikus öntözés elindítva (Z" + 
+      "⏰ Nincs válasz 30 percig — automatikus öntözés elindítva (Z" + 
       String(pendingWater.zoneIdx + 1) + ")", "");
   }
 }
@@ -987,7 +987,7 @@ String getStatusText() {
   else txt += " (nagyon gyenge)";
   txt += "\n";
   if (!isnan(dhtTemp)) {
-    txt += "🌡 " + String((int)dhtTemp) + "°C  💧" + String((int)dhtHum) + "%\n";
+    txt += "🌡 Panel: " + String((int)dhtTemp) + "°C  💧" + String((int)dhtHum) + "%\n";
   }
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t totalHeap = 81920;
