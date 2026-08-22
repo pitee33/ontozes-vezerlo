@@ -1395,6 +1395,27 @@ void setup() {
     bootMsg += "FW: " + currentVersion + "\n";
     bootMsg += "NTP: " + String(ntpSynced ? "OK" : "FAILED");
     sendTelegram(bootMsg, true);
+    
+    // Telegram parancs menü regisztrálása (/ gomb → autocomplete)
+    String cmds = "[";
+    cmds += "{\"command\":\"help\",\"description\":\"Parancsok listája\"},";
+    cmds += "{\"command\":\"status\",\"description\":\"Állapot lekérdezése\"},";
+    cmds += "{\"command\":\"schedule\",\"description\":\"Ütemezés lekérdezése\"},";
+    cmds += "{\"command\":\"zone1\",\"description\":\"Zone 1 indítása (perc)\"},";
+    cmds += "{\"command\":\"zone2\",\"description\":\"Zone 2 indítása (perc)\"},";
+    cmds += "{\"command\":\"zone3\",\"description\":\"Zone 3 indítása (perc)\"},";
+    cmds += "{\"command\":\"zone4\",\"description\":\"Zone 4 indítása (perc)\"},";
+    cmds += "{\"command\":\"stop\",\"description\":\"Összes leállítása\"},";
+    cmds += "{\"command\":\"set\",\"description\":\"Ütemezés (admin)\"},";
+    cmds += "{\"command\":\"clear\",\"description\":\"Ütemezés törlése (admin)\"},";
+    cmds += "{\"command\":\"weather\",\"description\":\"Időjárás info (admin)\"},";
+    cmds += "{\"command\":\"upgrade\",\"description\":\"Firmware frissítés (admin)\"},";
+    cmds += "{\"command\":\"reboot\",\"description\":\"Újraindítás (admin)\"},";
+    cmds += "{\"command\":\"flash\",\"description\":\"FLASH gomb debug (admin)\"},";
+    cmds += "{\"command\":\"wake\",\"description\":\"OLED ébresztése (admin)\"}";
+    cmds += "]";
+    botAdmin.setMyCommands(cmds);
+    Serial.println("Telegram parancs menü regisztrálva (admin)");
   }
   
   // Első OLED frissítés
