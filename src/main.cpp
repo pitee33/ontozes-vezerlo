@@ -1474,18 +1474,21 @@ void loop() {
     lastDhtRead = now;
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-    if (!isnan(t) && !isnan(h)) {
-      // DHT11 hibás adatok szűrése
-      if (h > 100.0) h = 100.0;  // pára max 100%
-      if (h < 0.0) h = 0.0;      // pára min 0%
-      if (t > 80.0 || t < -40.0) {
-        // Hőmérséklet ésszerűtlen — nem frissít
-        Serial.println("DHT hibás hőmérséklet, eldobva");
-      } else {
-        dhtTemp = t;
-        dhtHum = h;
-        Serial.printf("DHT: %.1f°C, %.0f%%\n", t, h);
-      }
+    
+    // Hőmérséklet külön szűrése
+    if (!isnan(t) && t >= -40.0 && t <= 80.0) {
+      dhtTemp = t;
+    }
+    
+    // Pára külön szűrése
+    if (!isnan(h)) {
+      if (h > 100.0) h = 100.0;
+      if (h < 0.0) h = 0.0;
+      dhtHum = h;
+    }
+    
+    if (!isnan(dhtTemp) && !isnan(dhtHum)) {
+      Serial.printf("DHT: %.1f°C, %.0f%%\n", dhtTemp, dhtHum);
     } else {
       Serial.println("DHT olvasás sikertelen");
     }
