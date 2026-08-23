@@ -89,37 +89,17 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.0"
+#define FIRMWARE_VERSION  "1.2.1"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
 // Időjárás (Open-Meteo — HTTP, ingyenes, nem kell API kulcs)
 // Törökbálint: 47.28°N, 18.92°E
-#define WEATHER_URL "http://api.open-meteo.com/v1/forecast?latitude=47.28&longitude=18.92&daily=precipitation_sum,precipitation_probability_max,temperature_2m_min&timezone=Europe/Budapest&forecast_days=1"
+#define WEATHER_URL "http://api.open-meteo.com/v1/forecast?latitude=47.28&longitude=18.92&daily=precipitation_sum,precipitation_probability_max&timezone=Europe/Budapest&forecast_days=1"
 #define WEATHER_CHECK_MS 1800000UL  // 30 perc
 #define RAIN_THRESHOLD_MM 1.0      // >1mm eső = esős nap
 #define RAIN_THRESHOLD_PROB 50     // >50% valószínűség = esős
 #define WATER_TIMEOUT_MS 1800000UL  // 30 perc válasz nélkül → auto öntöz
-
-// Faggyvédelem
-#define FROST_THRESHOLD 5.0        // <5°C → faggyvédelem
-
-// Szezonális módosítás (duration multiplier hónap alapján)
-// Tavasz (3-5): 0.8, Nyár (6-8): 1.3, Ősz (9-10): 0.7, Tél (11-2): 0.0
-// A duration-t ezzel szorozzuk
-
-// Maximum napi öntözés limit (perc/zóna/nap)
-#define DAILY_LIMIT_MIN 30
-
-// Öntözési napló (LittleFS)
-#define LOG_MAX_ENTRIES 50
-#define LOG_FILE "/waterlog.json"
-
-// Vízfogyasztás becslés (liter/perc átlagos csapvíz nyomással)
-#define DEFAULT_FLOW_RATE 8.0      // liter/perc zónánként
-
-// Web interface
-#define WEB_PORT 80
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -209,10 +189,8 @@ unsigned long lastDhtRead = 0;
 // Időjárás adatok
 float todayRainMm = 0.0;       // Mai eső mennyiség (mm)
 int todayRainProb = 0;         // Mai eső valószínűség (%)
-float todayMinTemp = 99.0;     // Mai minimum hőmérséklet (°C)
 bool weatherChecked = false;   // Sikerült-e lekérni
 bool isRainyDay = false;        // Esős nap-e
-bool isFrostDay = false;        // Faggyveszélyes nap-e
 
 // Pending locsolás kérdés (inline gombos)
 struct PendingWater {
@@ -226,167 +204,6 @@ struct PendingWater {
   bool waterYes;               // Igent mondott?
 };
 PendingWater pendingWater = { false, 0, 0, 0, 0, 0, false, false };
-
-// ==================== ZÓNA SORREND (QUEUE) ====================
-
-struct ZoneQueueItem {
-  bool active;
-  int zoneIdx;
-  int duration;
-};
-ZoneQueueItem zoneQueue[8];  // max 8 elem a sorban
-int zoneQueueCount = 0;
-
-// ==================== NAPI LIMIT ====================
-
-int dailyWateredMin[NUM_ZONES] = {0, 0, 0, 0};  // ma mennyit öntöztünk
-int dailyLogDate = 0;  // nap száma az évben (reset detektálás)
-
-// ==================== ÖNTÖZÉSI NAPLÓ ====================
-
-struct LogEntry {
-  int zone;       // 1-4
-  int duration;   // perc
-  int day;        // nap
-  int month;      // hónap
-  int hour;       // óra
-  int min;        // perc
-  bool skipped;   // kihagyva (eső/fagy/limit)
-  String reason;  // miért (ha skipped)
-};
-LogEntry logEntries[LOG_MAX_ENTRIES];
-int logCount = 0;
-int logHead = 0;  // ring buffer index
-
-// ==================== WEB SERVER ====================
-
-ESP8266WebServer webServer(WEB_PORT);
-
-// ==================== SEGÉDFUNKCIÓK ====================
-
-// Szezonális duration multiplier
-float seasonalMultiplier() {
-  if (!ntpSynced) return 1.0;
-  time_t now = time(nullptr);
-  struct tm *tm = localtime(&now);
-  int month = tm->tm_mon + 1;  // 1-12
-  
-  if (month >= 3 && month <= 5)  return 0.8;   // Tavasz
-  if (month >= 6 && month <= 8)  return 1.3;   // Nyár
-  if (month >= 9 && month <= 10) return 0.7;   // Ősz
-  return 0.0;  // Tél (11, 12, 1, 2) — nem öntöz
-}
-
-// Szezonális duration alkalmazása
-int applySeasonalDuration(int duration) {
-  float mult = seasonalMultiplier();
-  int adjusted = (int)(duration * mult);
-  if (adjusted < 1 && mult > 0) adjusted = 1;  // min 1p ha nem tél
-  return adjusted;
-}
-
-// Napi limit reset (éjfélkor)
-void checkDailyReset() {
-  if (!ntpSynced) return;
-  time_t now = time(nullptr);
-  struct tm *tm = localtime(&now);
-  int todayDay = tm->tm_yday;  // 0-365
-  
-  if (dailyLogDate != todayDay) {
-    dailyLogDate = todayDay;
-    for (int i = 0; i < NUM_ZONES; i++) {
-      dailyWateredMin[i] = 0;
-    }
-    Serial.println("Napi limit reset (új nap)");
-  }
-}
-
-// Forward declaration — korán kell, mert addLogEntry hívja
-void saveLog();
-
-// Naplóbejegyzés hozzáadása
-void addLogEntry(int zone, int duration, bool skipped, const String& reason) {
-  LogEntry entry;
-  entry.zone = zone;
-  entry.duration = duration;
-  entry.skipped = skipped;
-  entry.reason = reason;
-  
-  if (ntpSynced) {
-    time_t now = time(nullptr);
-    struct tm *tm = localtime(&now);
-    entry.day = tm->tm_mday;
-    entry.month = tm->tm_mon + 1;
-    entry.hour = tm->tm_hour;
-    entry.min = tm->tm_min;
-  } else {
-    entry.day = entry.month = entry.hour = entry.min = 0;
-  }
-  
-  logEntries[logHead] = entry;
-  logHead = (logHead + 1) % LOG_MAX_ENTRIES;
-  if (logCount < LOG_MAX_ENTRIES) logCount++;
-  
-  // Mentés LittleFS-be (csak ha nem túl gyakran)
-  saveLog();
-}
-
-// Napló mentése LittleFS-be
-void saveLog() {
-  DynamicJsonDocument doc(8192);
-  JsonArray arr = doc.to<JsonArray>();
-  
-  int startIdx = (logCount < LOG_MAX_ENTRIES) ? 0 : logHead;
-  for (int i = 0; i < logCount; i++) {
-    int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-    JsonObject e = arr.createNestedObject();
-    e["z"] = logEntries[idx].zone;
-    e["d"] = logEntries[idx].duration;
-    e["sk"] = logEntries[idx].skipped ? 1 : 0;
-    e["r"] = logEntries[idx].reason;
-    e["dy"] = logEntries[idx].day;
-    e["mo"] = logEntries[idx].month;
-    e["h"] = logEntries[idx].hour;
-    e["mi"] = logEntries[idx].min;
-  }
-  
-  File f = LittleFS.open(LOG_FILE, "w");
-  serializeJson(doc, f);
-  f.close();
-}
-
-// Napló betöltése LittleFS-ből
-void loadLog() {
-  File f = LittleFS.open(LOG_FILE, "r");
-  if (!f) return;
-  DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-  if (err) return;
-  
-  JsonArray arr = doc.as<JsonArray>();
-  logCount = 0;
-  logHead = 0;
-  for (JsonObject e : arr) {
-    if (logCount >= LOG_MAX_ENTRIES) break;
-    logEntries[logHead].zone = e["z"] | 1;
-    logEntries[logHead].duration = e["d"] | 0;
-    logEntries[logHead].skipped = e["sk"] | 0;
-    logEntries[logHead].reason = e["r"] | "";
-    logEntries[logHead].day = e["dy"] | 0;
-    logEntries[logHead].month = e["mo"] | 0;
-    logEntries[logHead].hour = e["h"] | 0;
-    logEntries[logHead].min = e["mi"] | 0;
-    logHead = (logHead + 1) % LOG_MAX_ENTRIES;
-    logCount++;
-  }
-  Serial.println("Napló betöltve: " + String(logCount) + " bejegyzés");
-}
-
-// Vízfogyasztás becslés (liter)
-float estimateWaterLiters(int zoneIdx, int durationMin) {
-  return durationMin * DEFAULT_FLOW_RATE;
-}
 
 // ==================== OLED SLEEP / WAKE ====================
 
@@ -424,14 +241,6 @@ void checkOledSleep() {
 // Forward declaration
 void askWaterQuestion(int zoneIdx, int duration, int schedSlot, int schedHour, int schedMin);
 void handleCallbackQuery(String callbackData, String chatId, String messageId);
-void startZone(int zoneIdx, int minutes);
-void stopZone(int zoneIdx);
-void addToQueue(int zoneIdx, int duration);
-void processQueue();
-bool isAnyZoneRunning();
-void handleWebRoot();
-void handleWebLog();
-void sendTelegram(const String &msg, bool adminOnly = false);
 
 // ==================== FLASH GOMB ====================
 
@@ -679,7 +488,7 @@ void updateOled() {
 
 // ==================== TELEGRAM ====================
 
-void sendTelegram(const String &msg, bool adminOnly) {
+void sendTelegram(const String &msg, bool adminOnly = false) {
   if (!botAdmin.sendMessage(ADMIN_CHAT_ID, msg, "")) {
     Serial.println("sendTelegram: admin bot HIBA, SSL reset");
     securedClient.stop();
@@ -787,143 +596,35 @@ void loadSchedule() {
 
 // ==================== ZÓNA VEZÉRLÉS ====================
 
-// Queue: elem hozzáadása a sorhoz
-void addToQueue(int zoneIdx, int duration) {
-  if (zoneQueueCount >= 8) {
-    Serial.println("Queue tele — elem eldobva");
-    return;
-  }
-  zoneQueue[zoneQueueCount].active = true;
-  zoneQueue[zoneQueueCount].zoneIdx = zoneIdx;
-  zoneQueue[zoneQueueCount].duration = duration;
-  zoneQueueCount++;
-  Serial.printf("Queue: Z%d %dp hozzáadva (sor: %d)\n", zoneIdx + 1, duration, zoneQueueCount);
-}
-
-// Queue: következő elem feldolgozása
-void processQueue() {
-  if (zoneQueueCount == 0) return;
-  if (isAnyZoneRunning()) return;
-  
-  // Első elem kivenni
-  int z = zoneQueue[0].zoneIdx;
-  int d = zoneQueue[0].duration;
-  
-  // Balra tolás
-  for (int i = 1; i < zoneQueueCount; i++) {
-    zoneQueue[i - 1] = zoneQueue[i];
-  }
-  zoneQueueCount--;
-  
-  Serial.printf("Queue: Z%d %dp indítása\n", z + 1, d);
-  startZone(z, d);
-}
-
-// Van-e futó zóna?
-bool isAnyZoneRunning() {
-  for (int i = 0; i < NUM_ZONES; i++) {
-    if (zones[i].active) return true;
-  }
-  return false;
-}
-
 void startZone(int zoneIdx, int minutes) {
   if (zoneIdx < 0 || zoneIdx >= NUM_ZONES) return;
-  
-  // Szezonális módosítás
-  float mult = seasonalMultiplier();
-  if (mult == 0.0) {
-    String msg = "❄️ Tél — nincs öntözés (Z" + String(zoneIdx + 1) + ")";
-    sendTelegram(msg);
-    addLogEntry(zoneIdx + 1, minutes, true, "Tél — szezonális skip");
-    Serial.println(msg);
-    return;
-  }
-  int adjustedDuration = applySeasonalDuration(minutes);
-  
-  // Napi limit ellenőrzés
-  if (dailyWateredMin[zoneIdx] + adjustedDuration > DAILY_LIMIT_MIN) {
-    String msg = "⚠️ Napi limit elérve (Z" + String(zoneIdx + 1) + ")!\n";
-    msg += "Már öntözve: " + String(dailyWateredMin[zoneIdx]) + "p\n";
-    msg += "Kért: " + String(adjustedDuration) + "p\n";
-    msg += "Limit: " + String(DAILY_LIMIT_MIN) + "p";
-    sendTelegram(msg);
-    addLogEntry(zoneIdx + 1, adjustedDuration, true, "Napi limit túllépés");
-    Serial.println(msg);
-    return;
-  }
-  
-  // Queue: ha már fut egy zóna → sorba teszi
-  bool anotherRunning = false;
-  for (int i = 0; i < NUM_ZONES; i++) {
-    if (i != zoneIdx && zones[i].active) {
-      anotherRunning = true;
-      break;
-    }
-  }
-  if (anotherRunning) {
-    addToQueue(zoneIdx, adjustedDuration);
-    String msg = "📋 Z" + String(zoneIdx + 1) + " sorba téve (" + String(adjustedDuration) + 
-                 "p) — másik zóna fut";
-    sendTelegram(msg, true);
-    return;
-  }
-  
-  // Ha ez a zóna már fut → ne indítsa újra
-  if (zones[zoneIdx].active) {
-    Serial.println("Z" + String(zoneIdx + 1) + " már fut — skip");
-    return;
-  }
-  
   zones[zoneIdx].active = true;
   zones[zoneIdx].startTime = millis();
-  zones[zoneIdx].durationMinutes = adjustedDuration;
+  zones[zoneIdx].durationMinutes = minutes;
   digitalWrite(zones[zoneIdx].pin, RELAY_ON);
   
   String msg = "💧 Zone " + String(zoneIdx + 1) + " ELINDITVA (" + 
-               String(adjustedDuration) + " perc";
-  if (adjustedDuration != minutes) {
-    msg += ", eredet " + String(minutes) + "p";
-  }
-  msg += ")";
+               String(minutes) + " perc)";
   sendTelegram(msg);
   updateBlynkStatus();
   wakeOled();
-  
-  addLogEntry(zoneIdx + 1, adjustedDuration, false, "");
 }
 
 void stopZone(int zoneIdx) {
   if (zoneIdx < 0 || zoneIdx >= NUM_ZONES) return;
-  if (!zones[zoneIdx].active) return;
-  
-  // Eltelt idő hozzáadása a napi limithez
-  unsigned long elapsedMin = (millis() - zones[zoneIdx].startTime) / 1000 / 60;
-  if (elapsedMin < 1) elapsedMin = 1;  // min 1p
-  if (elapsedMin > zones[zoneIdx].durationMinutes) elapsedMin = zones[zoneIdx].durationMinutes;
-  dailyWateredMin[zoneIdx] += (int)elapsedMin;
-  
   zones[zoneIdx].active = false;
   digitalWrite(zones[zoneIdx].pin, RELAY_OFF);
   
-  String msg = "✅ Zone " + String(zoneIdx + 1) + " LEALLITVA (" + 
-               String((int)elapsedMin) + "p elapsed)";
+  String msg = "✅ Zone " + String(zoneIdx + 1) + " LEALLITVA";
   sendTelegram(msg);
   updateBlynkStatus();
   wakeOled();
-  
-  addLogEntry(zoneIdx + 1, (int)elapsedMin, false, "stop");
-  
-  // Queue feldolgozása — következő zóna indítása
-  processQueue();
 }
 
 void stopAllZones() {
   for (int i = 0; i < NUM_ZONES; i++) {
     if (zones[i].active) stopZone(i);
   }
-  // Queue ürítése is
-  zoneQueueCount = 0;
 }
 
 void checkRunningZones() {
@@ -967,29 +668,7 @@ void checkSchedule() {
       
       // Ütemezett időpontban: ha nincs pending kérdés → simán öntöz
       if (curHour == schedH && curMin == schedM && !pendingWater.active) {
-        // Faggyvédelem ellenőrzés
-        if (isFrostDay) {
-          String msg = "🥶 Faggyvédelem! Z" + String(i + 1) + " öntözés kihagyva.\n";
-          msg += "Min hőm: " + String(todayMinTemp, 1) + "°C";
-          if (!isnan(dhtTemp)) msg += " / DHT: " + String(dhtTemp, 1) + "°C";
-          sendTelegram(msg);
-          addLogEntry(i + 1, zones[i].schedules[s].duration, true, "Faggyvédelem");
-          Serial.println(msg);
-          break;
-        }
-        
-        // Szezonális módosítás
-        float mult = seasonalMultiplier();
-        if (mult == 0.0) {
-          String msg = "❄️ Tél — Z" + String(i + 1) + " öntözés kihagyva (szezonális)";
-          sendTelegram(msg, true);
-          addLogEntry(i + 1, zones[i].schedules[s].duration, true, "Tél — szezonális skip");
-          Serial.println(msg);
-          break;
-        }
-        
-        int adjDur = applySeasonalDuration(zones[i].schedules[s].duration);
-        startZone(i, adjDur);
+        startZone(i, zones[i].schedules[s].duration);
         break;
       }
     }
@@ -1035,7 +714,6 @@ void checkWeather() {
   
   JsonArray precipSum = daily["precipitation_sum"];
   JsonArray precipProb = daily["precipitation_probability_max"];
-  JsonArray tempMin = daily["temperature_2m_min"];
   
   if (precipSum.isNull() || precipProb.isNull()) {
     Serial.println("Weather: nincs precipitation adat");
@@ -1044,30 +722,13 @@ void checkWeather() {
   
   todayRainMm = precipSum[0].as<float>();
   todayRainProb = precipProb[0].as<int>();
-  
-  // Minimum hőmérséklet parse-olás
-  if (!tempMin.isNull()) {
-    todayMinTemp = tempMin[0].as<float>();
-  }
-  
   weatherChecked = true;
   
   // Esős nap ha >1mm eső vagy >50% valószínűség
   isRainyDay = (todayRainMm >= RAIN_THRESHOLD_MM || todayRainProb >= RAIN_THRESHOLD_PROB);
   
-  // Faggyvédelem: <5°C minimum vagy DHT <5°C
-  isFrostDay = false;
-  if (todayMinTemp < FROST_THRESHOLD) {
-    isFrostDay = true;
-  }
-  if (!isnan(dhtTemp) && dhtTemp < FROST_THRESHOLD) {
-    isFrostDay = true;
-  }
-  
-  Serial.printf("Weather: %.1fmm, %d%% prob, min %.1f°C -> %s %s\n", 
-                todayRainMm, todayRainProb, todayMinTemp,
-                isRainyDay ? "ESŐS" : "száraz",
-                isFrostDay ? "FAGY" : "");
+  Serial.printf("Weather: %.1fmm, %d%% prob -> %s\n", 
+                todayRainMm, todayRainProb, isRainyDay ? "ESŐS" : "száraz");
 }
 
 // ==================== LOC SOLÁS KÉRDÉS ====================
@@ -1142,7 +803,6 @@ void checkPendingWaterTimeout() {
       // Felhasználó kihagyta
       botAdmin.sendMessage(ADMIN_CHAT_ID, 
         "🌧 Öntözés kihagyva (Z" + String(z + 1) + "). Ahogy kérted.", "");
-      addLogEntry(z + 1, d, true, "Felhasználó kihagyta (esős)");
       Serial.println("Water: kihagyva (válasz = nem)");
     } else {
       // Igent mondott VAGY nem válaszolt → öntöz
@@ -1154,16 +814,7 @@ void checkPendingWaterTimeout() {
       } else {
         Serial.println("Water: igent mondott — öntöz");
       }
-      // Szezonális módosítás alkalmazása
-      float mult = seasonalMultiplier();
-      if (mult == 0.0) {
-        String msg = "❄️ Tél — nincs öntözés (Z" + String(z + 1) + ")";
-        sendTelegram(msg, true);
-        addLogEntry(z + 1, d, true, "Tél — szezonális skip");
-        Serial.println(msg);
-      } else {
-        startZone(z, d);  // startZone belül alkalmazza a szezonális módosítást
-      }
+      startZone(z, d);
     }
   }
 }
@@ -1395,11 +1046,6 @@ String getStatusText() {
   if (weatherChecked) {
     txt += "🌤 " + String(todayRainMm, 1) + "mm/" + String(todayRainProb) + "% ";
     txt += isRainyDay ? "(esős)" : "(száraz)";
-    txt += "\n";
-    if (isFrostDay) txt += "🥶 Faggyvédelem aktív\n";
-    txt += "🌡 Min: " + String(todayMinTemp, 1) + "°C";
-    float mult = seasonalMultiplier();
-    txt += " | Szezon: x" + String(mult, 1);
   }
   return txt;
 }
@@ -1413,8 +1059,6 @@ String getHelpText(bool isAdmin) {
   h += "/stop — Összes leállítása\n";
   h += "/status — Állapot lekérdezése\n";
   h += "/schedule — Ütemezés lekérdezése\n";
-  h += "/log — Utolsó 10 naplóbejegyzés\n";
-  h += "/stats — Heti/havi összegzés\n";
   if (isAdmin) {
     h += "\n*Admin:*\n";
     h += "/set <zone> <slot> <ora> <perc> <dur>\n";
@@ -1620,95 +1264,9 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     String msg = "🌤 *Időjárás (Törökbálint)*\n";
     msg += "Eső ma: " + String(todayRainMm, 1) + " mm\n";
     msg += "Eső valószínű: " + String(todayRainProb) + "%\n";
-    msg += "Min hőm: " + String(todayMinTemp, 1) + "°C\n";
-    msg += "Státusz: " + String(isRainyDay ? "🌧 ESŐS nap" : "☀️ Száraz nap") + "\n";
-    msg += "Faggy: " + String(isFrostDay ? "🥶 IGEN" : "✅ Nincs") + "\n\n";
+    msg += "Státusz: " + String(isRainyDay ? "🌧 ESŐS nap" : "☀️ Száraz nap") + "\n\n";
     msg += "Locsolás: " + String(isRainyDay ? "kérdezni fog" : "automatikus");
     bot.sendMessage(chatId, msg, "Markdown");
-    return;
-  }
-  
-  // /log — utolsó 10 naplóbejegyzés
-  if (text == "/log") {
-    if (logCount == 0) {
-      bot.sendMessage(chatId, "📋 Nincs naplóbejegyzés", "");
-      return;
-    }
-    String s = "📋 *Öntözési napló (utolsó 10)*\n\n";
-    int displayCount = (logCount < 10) ? logCount : 10;
-    int startIdx = (logCount < LOG_MAX_ENTRIES) ? logCount - displayCount 
-                                                : logHead - displayCount + LOG_MAX_ENTRIES;
-    if (startIdx < 0) startIdx += LOG_MAX_ENTRIES;
-    
-    for (int i = 0; i < displayCount; i++) {
-      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-      LogEntry &e = logEntries[idx];
-      char ts[12];
-      sprintf(ts, "%02d.%02d %02d:%02d", e.month, e.day, e.hour, e.min);
-      s += String(ts) + " Z" + String(e.zone) + " ";
-      if (e.skipped) {
-        s += "⚠️ SKIP (" + e.reason + ")";
-      } else {
-        s += "💧 " + String(e.duration) + "p";
-      }
-      s += "\n";
-    }
-    bot.sendMessage(chatId, s, "Markdown");
-    return;
-  }
-  
-  // /stats — heti/havi összegzés
-  if (text == "/stats") {
-    if (logCount == 0) {
-      bot.sendMessage(chatId, "📊 Nincs adat a statisztikához", "");
-      return;
-    }
-    
-    time_t now = time(nullptr);
-    struct tm *tm = localtime(&now);
-    int curMonth = tm->tm_mon + 1;
-    int curDay = tm->tm_mday;
-    
-    int monthWater = 0, monthSkip = 0, monthDuration = 0;
-    int weekWater = 0, weekSkip = 0, weekDuration = 0;
-    float monthLiters = 0.0, weekLiters = 0.0;
-    
-    int startIdx = (logCount < LOG_MAX_ENTRIES) ? 0 : logHead;
-    for (int i = 0; i < logCount; i++) {
-      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-      LogEntry &e = logEntries[idx];
-      
-      // Havi stat
-      if (e.month == curMonth) {
-        if (e.skipped) monthSkip++;
-        else {
-          monthWater++;
-          monthDuration += e.duration;
-          monthLiters += estimateWaterLiters(e.zone - 1, e.duration);
-        }
-      }
-      
-      // Heti stat (utolsó 7 nap)
-      if (e.month == curMonth && e.day >= curDay - 6) {
-        if (e.skipped) weekSkip++;
-        else {
-          weekWater++;
-          weekDuration += e.duration;
-          weekLiters += estimateWaterLiters(e.zone - 1, e.duration);
-        }
-      }
-    }
-    
-    String s = "📊 *Statisztika*\n\n";
-    s += "*Ezen a héten:*\n";
-    s += "💧 Öntözés: " + String(weekWater) + "x (" + String(weekDuration) + "p)\n";
-    s += "⚠️ Skip: " + String(weekSkip) + "x\n";
-    s += "🌊 Vízfogyasztás: ~" + String((int)weekLiters) + " liter\n\n";
-    s += "*Ebben a hónapban:*\n";
-    s += "💧 Öntözés: " + String(monthWater) + "x (" + String(monthDuration) + "p)\n";
-    s += "⚠️ Skip: " + String(monthSkip) + "x\n";
-    s += "🌊 Havi fogyasztás: ~" + String((int)monthLiters) + " liter";
-    bot.sendMessage(chatId, s, "Markdown");
     return;
   }
   
@@ -1744,147 +1302,6 @@ void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool 
     ESP.wdtFeed();
     numNew = bot.getUpdates(bot.last_message_received + 1);
   }
-}
-
-// ==================== WEB INTERFACE ====================
-
-void handleWebRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>Ontozes Vezerles v" + currentVersion + "</title>";
-  html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:0;padding:10px;background:#f0f0f0;}";
-  html += "h1{font-size:1.4em;color:#2e7d32;}";
-  html += "h2{font-size:1.1em;color:#1565c0;margin-top:15px;border-bottom:1px solid #ccc;padding-bottom:3px;}";
-  html += "table{width:100%;border-collapse:collapse;margin-bottom:10px;}";
-  html += "th,td{text-align:left;padding:4px 8px;font-size:0.9em;}";
-  html += "th{background:#e8f5e9;}";
-  html += ".on{color:#2e7d32;font-weight:bold;}";
-  html += ".off{color:#c62828;}";
-  html += ".card{background:white;border-radius:8px;padding:10px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.1);}";
-  html += "</style></head><body>";
-  
-  html += "<h1>🌿 Öntözésvezérlés</h1>";
-  html += "<p>FW: " + currentVersion + " | IP: " + WiFi.localIP().toString() + "</p>";
-  
-  // Zóna státusz
-  html += "<div class='card'><h2>Zónák</h2><table>";
-  html += "<tr><th>Zóna</th><th>Állapot</th><th>Hátralév</th><th>Napi öntözés</th><th>Ütemezés</th></tr>";
-  for (int i = 0; i < NUM_ZONES; i++) {
-    html += "<tr><td>Z" + String(i + 1) + "</td>";
-    if (zones[i].active) {
-      unsigned long elapsed = (millis() - zones[i].startTime) / 1000;
-      int remaining = zones[i].durationMinutes * 60 - elapsed;
-      if (remaining < 0) remaining = 0;
-      char rem[8];
-      sprintf(rem, "%d:%02d", remaining / 60, remaining % 60);
-      html += "<td class='on'>ON</td><td>" + String(rem) + "</td>";
-    } else {
-      html += "<td class='off'>OFF</td><td>---</td>";
-    }
-    html += "<td>" + String(dailyWateredMin[i]) + "/" + String(DAILY_LIMIT_MIN) + "p</td>";
-    html += "<td>" + nextScheduleTime(i) + " (" + String(countSchedules(i)) + "x)</td>";
-    html += "</tr>";
-  }
-  html += "</table>";
-  if (zoneQueueCount > 0) {
-    html += "<p>📋 Sorban: " + String(zoneQueueCount) + " elem</p>";
-  }
-  html += "</div>";
-  
-  // Időjárás
-  html += "<div class='card'><h2>Időjárás</h2>";
-  if (weatherChecked) {
-    html += "<p>Eső: " + String(todayRainMm, 1) + "mm / " + String(todayRainProb) + "%";
-    html += " | Min hőm: " + String(todayMinTemp, 1) + "°C</p>";
-    html += "<p>Státusz: " + String(isRainyDay ? "🌧 ESŐS" : "☀️ Száraz");
-    html += " | " + String(isFrostDay ? "🥶 FAGY" : "OK") + "</p>";
-  } else {
-    html += "<p>Nincs adat</p>";
-  }
-  html += "</div>";
-  
-  // DHT11
-  html += "<div class='card'><h2>DHT11</h2>";
-  if (!isnan(dhtTemp)) {
-    html += "<p>" + String(dhtTemp, 1) + "°C | " + String(dhtHum, 0) + "%</p>";
-  } else {
-    html += "<p>Nincs adat</p>";
-  }
-  html += "</div>";
-  
-  // Rendszer info
-  html += "<div class='card'><h2>Rendszer</h2>";
-  html += "<p>Uptime: " + uptimeStr() + "</p>";
-  html += "<p>WiFi: " + String(WiFi.RSSI()) + " dBm</p>";
-  html += "<p>Heap: " + String(ESP.getFreeHeap() / 1024) + " kB</p>";
-  html += "<p>NTP: " + String(ntpSynced ? "OK" : "N/A") + "</p>";
-  time_t now = time(nullptr);
-  if (ntpSynced) {
-    html += "<p>Idő: " + String(ctime(&now)) + "</p>";
-  }
-  html += "</div>";
-  
-  // Napló utolsó 10
-  html += "<div class='card'><h2>Napló (utolsó 10)</h2>";
-  if (logCount == 0) {
-    html += "<p>Nincs bejegyzés</p>";
-  } else {
-    html += "<table><tr><th>Idő</th><th>Zóna</th><th>Esemény</th></tr>";
-    int displayCount = (logCount < 10) ? logCount : 10;
-    int startIdx = (logCount < LOG_MAX_ENTRIES) ? logCount - displayCount 
-                                                : logHead - displayCount + LOG_MAX_ENTRIES;
-    if (startIdx < 0) startIdx += LOG_MAX_ENTRIES;
-    for (int i = 0; i < displayCount; i++) {
-      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-      LogEntry &e = logEntries[idx];
-      char ts[16];
-      sprintf(ts, "%02d.%02d %02d:%02d", e.month, e.day, e.hour, e.min);
-      html += "<tr><td>" + String(ts) + "</td><td>Z" + String(e.zone) + "</td>";
-      if (e.skipped) {
-        html += "<td>SKIP (" + e.reason + ")</td>";
-      } else {
-        html += "<td>" + String(e.duration) + "p</td>";
-      }
-      html += "</tr>";
-    }
-    html += "</table>";
-  }
-  html += "</div>";
-  
-  html += "<p style='text-align:center;color:#888;font-size:0.8em;'>v" + currentVersion + "</p>";
-  html += "</body></html>";
-  
-  webServer.send(200, "text/html", html);
-}
-
-void handleWebLog() {
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<title>Napló</title>";
-  html += "<style>body{font-family:monospace;margin:10px;}table{border-collapse:collapse;}";
-  html += "th,td{border:1px solid #ddd;padding:4px 8px;font-size:0.85em;}</style></head><body>";
-  html += "<h2>Öntözési napló</h2>";
-  html += "<p><a href='/'>← Vissza</a></p>";
-  
-  if (logCount == 0) {
-    html += "<p>Nincs bejegyzés</p>";
-  } else {
-    html += "<table><tr><th>Dátum</th><th>Zóna</th><th>Perc</th><th>Skip</th><th>Ok</th></tr>";
-    int startIdx = (logCount < LOG_MAX_ENTRIES) ? 0 : logHead;
-    for (int i = 0; i < logCount; i++) {
-      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-      LogEntry &e = logEntries[idx];
-      char ts[16];
-      sprintf(ts, "%02d.%02d %02d:%02d", e.month, e.day, e.hour, e.min);
-      html += "<tr><td>" + String(ts) + "</td><td>Z" + String(e.zone) + "</td>";
-      html += "<td>" + String(e.duration) + "</td>";
-      html += "<td>" + String(e.skipped ? "IGEN" : "-") + "</td>";
-      html += "<td>" + e.reason + "</td></tr>";
-    }
-    html += "</table>";
-  }
-  html += "</body></html>";
-  webServer.send(200, "text/html", html);
 }
 
 // ==================== BLYNK HANDLERS ====================
@@ -1940,7 +1357,6 @@ void setup() {
   // LittleFS
   LittleFS.begin();
   loadSchedule();
-  loadLog();
   
   // OLED inicializálás (Ideaspark v2.1: SDA=GPIO12, SCL=GPIO14)
   Wire.begin(12, 14);  // SDA=D6/GPIO12, SCL=D5/GPIO14
@@ -1951,7 +1367,7 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("Ontozes Vezerles");
-    display.println("v1.3.0 Booting...");
+    display.println("v1.2.0 Booting...");
     display.display();
     Serial.println("OLED OK");
     lastActivity = millis();  // OLED ébren boot után
@@ -2020,8 +1436,6 @@ void setup() {
     cmds += "{\"command\":\"help\",\"description\":\"Parancsok listája\"},";
     cmds += "{\"command\":\"status\",\"description\":\"Állapot lekérdezése\"},";
     cmds += "{\"command\":\"schedule\",\"description\":\"Ütemezés lekérdezése\"},";
-    cmds += "{\"command\":\"log\",\"description\":\"Napló utolsó 10 bejegyzés\"},";
-    cmds += "{\"command\":\"stats\",\"description\":\"Heti/havi összegzés\"},";
     cmds += "{\"command\":\"zone1\",\"description\":\"Zone 1 indítása (perc)\"},";
     cmds += "{\"command\":\"zone2\",\"description\":\"Zone 2 indítása (perc)\"},";
     cmds += "{\"command\":\"zone3\",\"description\":\"Zone 3 indítása (perc)\"},";
@@ -2047,13 +1461,7 @@ void setup() {
     checkWeather();
   }
   
-  // Web interface indítása
-  webServer.on("/", handleWebRoot);
-  webServer.on("/log", handleWebLog);
-  webServer.begin();
-  Serial.println("Web interface elindítva (port 80)");
-  
-  Serial.println("Setup kész! (v1.3.0)");
+  Serial.println("Setup kész! (v1.2.0)");
 }
 
 void loop() {
@@ -2083,12 +1491,6 @@ void loop() {
   
   // Futó zónák ellenőrzése
   checkRunningZones();
-  
-  // Napi limit reset (éjfélkor)
-  checkDailyReset();
-  
-  // Web interface kliensek kezelése
-  webServer.handleClient();
   
   // Ütemezés ellenőrzése (1 másodpercenként)
   if (now - lastScheduleCheck > 1000) {
