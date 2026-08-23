@@ -198,9 +198,12 @@ struct PendingWater {
   int zoneIdx;                 // Melyik zóna
   int duration;                // Hány perc
   int schedSlot;               // Melyik slot indította
-  unsigned long askTime;       // Mikor tettük fel a kérdést
+  int schedHour;               // Ütemezett óra
+  int schedMin;                // Ütemezett perc
+  bool answered;               // Válaszolt a felhasználó?
+  bool waterYes;               // Igent mondott?
 };
-PendingWater pendingWater = { false, 0, 0, 0, 0 };
+PendingWater pendingWater = { false, 0, 0, 0, 0, 0, false, false };
 
 // ==================== OLED SLEEP / WAKE ====================
 
@@ -236,7 +239,7 @@ void checkOledSleep() {
 }
 
 // Forward declaration
-void askWaterQuestion(int zoneIdx, int duration, int schedSlot);
+void askWaterQuestion(int zoneIdx, int duration, int schedSlot, int schedHour, int schedMin);
 void handleCallbackQuery(String callbackData, String chatId, String messageId);
 
 // ==================== FLASH GOMB ====================
@@ -650,11 +653,22 @@ void checkSchedule() {
   for (int i = 0; i < NUM_ZONES; i++) {
     if (zones[i].active) continue;
     for (int s = 0; s < MAX_SCHEDULES; s++) {
-      if (zones[i].schedules[s].enabled &&
-          zones[i].schedules[s].hour == curHour &&
-          zones[i].schedules[s].min == curMin) {
-        // Időjárás-alapú locsolás: esős nap → kérdez
-        askWaterQuestion(i, zones[i].schedules[s].duration, s);
+      if (!zones[i].schedules[s].enabled) continue;
+      
+      int schedH = zones[i].schedules[s].hour;
+      int schedM = zones[i].schedules[s].min;
+      int schedTotalMin = schedH * 60 + schedM;
+      int curTotalMin = curHour * 60 + curMin;
+      
+      // 30 perccel előbb kérdez (csak ha nincs már aktív kérdés)
+      if (curTotalMin == schedTotalMin - 30 && !pendingWater.active) {
+        askWaterQuestion(i, zones[i].schedules[s].duration, s, schedH, schedM);
+        break;
+      }
+      
+      // Ütemezett időpontban: ha nincs pending kérdés → simán öntöz
+      if (curHour == schedH && curMin == schedM && !pendingWater.active) {
+        startZone(i, zones[i].schedules[s].duration);
         break;
       }
     }
@@ -725,63 +739,83 @@ String waterKeyboardJson() {
   return kb;
 }
 
-// Kérdés felvétele: esős nap + ütemezett locsolás előtt
-void askWaterQuestion(int zoneIdx, int duration, int schedSlot) {
-  // Friss időjárás lekérés a döntés előtt — ne 30 perces adatra támasszkodjon
+// Kérdés felvétele: 30 perccel az ütemezett öntözés előtt
+void askWaterQuestion(int zoneIdx, int duration, int schedSlot, int schedHour, int schedMin) {
+  // Friss időjárás lekérés a döntés előtt
   Serial.println("Ütemezett öntözés előtt — friss időjárás lekérés...");
   checkWeather();
   
   if (!weatherChecked) {
-    // Időjárás lekérés sikertelen — biztonsági okokból öntöz
-    Serial.println("Weather lekérés sikertelen — auto öntöz (biztonság)");
-    botAdmin.sendMessage(ADMIN_CHAT_ID, 
-      "⚠️ Időjárás lekérés sikertelen, automatikus öntözés (Z" + 
-      String(zoneIdx + 1) + ")", "");
-    startZone(zoneIdx, duration);
-    return;
+    Serial.println("Weather lekérés sikertelen — öntözés a tervezett időben");
+    return;  // Nem csinál semmit, a checkSchedule majd elindítja
   }
   
   if (!isRainyDay) {
-    // Nem esős — simán öntöz
-    Serial.println("Nem esős nap — auto öntöz");
-    startZone(zoneIdx, duration);
-    return;
+    Serial.println("Nem esős nap — öntözés a tervezett időben");
+    return;  // Nem kérdez, a checkSchedule majd elindítja
   }
   
-  // Esős nap — kérdezz
+  // Esős nap — kérdez 30 perccel előbb
   pendingWater.active = true;
   pendingWater.zoneIdx = zoneIdx;
   pendingWater.duration = duration;
   pendingWater.schedSlot = schedSlot;
-  pendingWater.askTime = millis();
+  pendingWater.schedHour = schedHour;
+  pendingWater.schedMin = schedMin;
+  pendingWater.answered = false;
+  pendingWater.waterYes = false;
   
   String msg = "🌧 *Esős nap van!*\n";
   msg += "Előrejelzés: " + String(todayRainMm, 1) + "mm eső, ";
   msg += String(todayRainProb) + "% valószínűség\n\n";
   msg += "*Zone " + String(zoneIdx + 1) + "* ütemezett öntözés: ";
-  msg += String(duration) + " perc\n\n";
-  msg += "Szükséges a locsolás?";
+  msg += String(schedHour) + ":" + (schedMin < 10 ? "0" : "") + String(schedMin);
+  msg += " (" + String(duration) + " perc)\n\n";
+  msg += "Szükséges a locsolás?\n";
+  msg += "_Ha nem válaszolsz, automatikusan öntöz a megadott időben._";
   
-  // Admin bot küld inline gombbal
   bool ok = botAdmin.sendMessageWithInlineKeyboard(ADMIN_CHAT_ID, msg, "Markdown", waterKeyboardJson());
   if (!ok) {
-    Serial.println("Water question küldés HIBA — auto öntöz");
+    Serial.println("Water question küldés HIBA — öntözés a tervezett időben");
     pendingWater.active = false;
-    startZone(zoneIdx, duration);
   }
   Serial.println("Water question elküldve (Z" + String(zoneIdx + 1) + ")");
 }
 
-// Pending water timeout ellenőrzés (10 perc → auto öntöz)
+// Ütemezett öntözés időpontjában: döntés a kérdés alapján
 void checkPendingWaterTimeout() {
   if (!pendingWater.active) return;
-  if (millis() - pendingWater.askTime > WATER_TIMEOUT_MS) {
-    Serial.println("Water question timeout — auto öntöz");
+  
+  time_t now = time(nullptr);
+  struct tm *tm = localtime(&now);
+  int curHour = tm->tm_hour;
+  int curMin = tm->tm_min;
+  
+  // Elértük az ütemezett időt?
+  if (curHour == pendingWater.schedHour && curMin == pendingWater.schedMin) {
+    int z = pendingWater.zoneIdx;
+    int d = pendingWater.duration;
+    bool yes = pendingWater.waterYes;
+    bool answered = pendingWater.answered;
     pendingWater.active = false;
-    startZone(pendingWater.zoneIdx, pendingWater.duration);
-    botAdmin.sendMessage(ADMIN_CHAT_ID, 
-      "⏰ Nincs válasz 30 percig — automatikus öntözés elindítva (Z" + 
-      String(pendingWater.zoneIdx + 1) + ")", "");
+    
+    if (answered && !yes) {
+      // Felhasználó kihagyta
+      botAdmin.sendMessage(ADMIN_CHAT_ID, 
+        "🌧 Öntözés kihagyva (Z" + String(z + 1) + "). Ahogy kérted.", "");
+      Serial.println("Water: kihagyva (válasz = nem)");
+    } else {
+      // Igent mondott VAGY nem válaszolt → öntöz
+      if (!answered) {
+        botAdmin.sendMessage(ADMIN_CHAT_ID, 
+          "⏰ Nincs válasz — automatikus öntözés az ütemezett időben (Z" + 
+          String(z + 1) + ")", "");
+        Serial.println("Water: nincs válasz — auto öntöz");
+      } else {
+        Serial.println("Water: igent mondott — öntöz");
+      }
+      startZone(z, d);
+    }
   }
 }
 
@@ -795,17 +829,18 @@ void handleCallbackQuery(String callbackData, String chatId, String messageId) {
   }
   
   if (callbackData == "water_yes") {
-    int z = pendingWater.zoneIdx;
-    int d = pendingWater.duration;
-    pendingWater.active = false;
-    startZone(z, d);
+    pendingWater.answered = true;
+    pendingWater.waterYes = true;
     botAdmin.sendMessage(chatId, 
-      "💧 Öntözés elindítva! (Z" + String(z + 1) + ", " + String(d) + "p)", "");
+      "✅ Rendben, öntözés az ütemezett időben (Z" + 
+      String(pendingWater.zoneIdx + 1) + ", " + String(pendingWater.schedHour) + 
+      ":" + (pendingWater.schedMin < 10 ? "0" : "") + String(pendingWater.schedMin) + ")", "");
   } else if (callbackData == "water_no") {
-    int z = pendingWater.zoneIdx;
-    pendingWater.active = false;
+    pendingWater.answered = true;
+    pendingWater.waterYes = false;
     botAdmin.sendMessage(chatId, 
-      "🌧 Öntözés kihagyva (Z" + String(z + 1) + "). Esős nap van!", "");
+      "🌧 Öntözés kihagyva (Z" + String(pendingWater.zoneIdx + 1) + 
+      "). Értem, esős nap van.", "");
   }
 }
 
