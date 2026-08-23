@@ -992,8 +992,8 @@ String getStatusText() {
   } else {
     txt += "\n⚠️ NTP nincs szinkronizálva\n";
   }
-  txt += "FW: " + currentVersion + "\n";
-  txt += "WiFi: " + String(WiFi.RSSI()) + " dBm";
+  txt += "📦 FW: " + currentVersion + "\n";
+  txt += "📶 WiFi: " + String(WiFi.RSSI()) + " dBm";
   int rssi = WiFi.RSSI();
   if (rssi >= -55) txt += " (kiváló)";
   else if (rssi >= -67) txt += " (jó)";
@@ -1006,8 +1006,8 @@ String getStatusText() {
   }
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t totalHeap = 81920;
-  txt += "Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
-  txt += "Uptime: " + uptimeStr() + "\n";
+  txt += "💾 Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
+  txt += "⏱ Uptime: " + uptimeStr() + "\n";
   if (weatherChecked) {
     txt += "🌤 " + String(todayRainMm, 1) + "mm/" + String(todayRainProb) + "% ";
     txt += isRainyDay ? "(esős)" : "(száraz)";
