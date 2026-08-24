@@ -89,7 +89,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.1"
+#define FIRMWARE_VERSION  "1.3.2"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -103,6 +103,9 @@
 
 // Faggyvédelem
 #define FROST_THRESHOLD 5.0        // <5°C → faggyvédelem
+
+// Szezonális módosítás (duration multiplier hónap alapján)
+// Tavasz (3-5): 0.8x, Nyár (6-8): 1.3x, Ősz (9-10): 0.7x, Tél (11-2): 0.0x (skip)
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -318,6 +321,27 @@ String nextScheduleTime(int zoneIdx) {
     return String(buf);
   }
   return "---";
+}
+
+// Szezonális duration multiplier hónap alapján
+float seasonalMultiplier() {
+  if (!ntpSynced) return 1.0;
+  time_t now = time(nullptr);
+  struct tm *tm = localtime(&now);
+  int month = tm->tm_mon + 1;  // 1-12
+  
+  if (month >= 3 && month <= 5)  return 0.8;   // Tavasz
+  if (month >= 6 && month <= 8)  return 1.3;   // Nyár
+  if (month >= 9 && month <= 10) return 0.7;   // Ősz
+  return 0.0;  // Tél (11, 12, 1, 2) — nem öntöz
+}
+
+// Szezonális duration alkalmazása
+int applySeasonalDuration(int duration) {
+  float mult = seasonalMultiplier();
+  int adjusted = (int)(duration * mult);
+  if (adjusted < 1 && mult > 0) adjusted = 1;  // min 1p ha nem tél
+  return adjusted;
 }
 
 // Uptime formázott string — nap/hónap bontás
@@ -688,7 +712,14 @@ void checkSchedule() {
           Serial.println("Faggyvédelem: skip öntözés (Z" + String(i + 1) + ")");
           break;
         }
-        startZone(i, zones[i].schedules[s].duration);
+        // Szezonális módosítás: télen nem öntöz
+        float mult = seasonalMultiplier();
+        if (mult == 0.0) {
+          Serial.println("Tél — öntözés kihagyva (Z" + String(i + 1) + ")");
+          break;
+        }
+        int adjDur = applySeasonalDuration(zones[i].schedules[s].duration);
+        startZone(i, adjDur);
         break;
       }
     }
@@ -1080,6 +1111,12 @@ String getStatusText() {
     txt += isRainyDay ? "(esős)" : "(száraz)";
     txt += " | Min: " + String(todayMinTemp, 1) + "°C";
     if (isFrostDay) txt += " ❄️FAGY";
+  }
+  float smult = seasonalMultiplier();
+  if (smult == 0.0) {
+    txt += "\n🌿 Tél — öntözés kihagyva";
+  } else if (smult != 1.0) {
+    txt += "\n🌿 Szezon: " + String((int)(smult * 100)) + "%";
   }
   return txt;
 }
