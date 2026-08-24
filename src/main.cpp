@@ -89,7 +89,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.6"
+#define FIRMWARE_VERSION  "1.3.7"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -119,9 +119,6 @@
 
 // Vízfogyasztás becslés (liter/perc)
 #define DEFAULT_FLOW_RATE 8.0
-
-// Web interface
-#define WEB_PORT 80
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -232,9 +229,6 @@ struct LogEntry {
 LogEntry logEntries[LOG_MAX_ENTRIES];
 int logCount = 0;
 int logHead = 0;
-
-// Web server
-ESP8266WebServer webServer(WEB_PORT);
 
 // ==================== IDŐJÁRÁS ====================
 
@@ -1742,126 +1736,6 @@ BLYNK_WRITE(VPIN_ZONE4) {
   else stopZone(3);
 }
 
-// ==================== WEB INTERFACE ====================
-
-void handleWebRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Ontozes Vezerles</title><style>";
-  html += "body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:0;padding:10px}";
-  html += "h1{color:#0f3460;background:#16213e;padding:10px;border-radius:5px}";
-  html += "table{border-collapse:collapse;width:100%;margin:10px 0}";
-  html += "th,td{border:1px solid #333;padding:6px;text-align:left}";
-  html += "th{background:#0f3460}.on{color:#0f0}.off{color:#f00}";
-  html += ".card{background:#16213e;padding:10px;border-radius:5px;margin:10px 0}";
-  html += "</style></head><body>";
-  html += "<h1>🌿 Ontozes Vezerles v" + currentVersion + "</h1>";
-  
-  // Zónák
-  html += "<div class='card'><h2>Zonak</h2><table><tr><th>Zona</th><th>Allapot</th><th>Ido</th><th>Ma</th></tr>";
-  for (int i = 0; i < NUM_ZONES; i++) {
-    html += "<tr><td>Z" + String(i + 1) + "</td>";
-    if (zones[i].active) {
-      unsigned long elapsed = (millis() - zones[i].startTime) / 1000;
-      int remaining = zones[i].durationMinutes * 60 - elapsed;
-      if (remaining < 0) remaining = 0;
-      html += "<td class='on'>ON</td><td>" + String(remaining / 60) + ":" + 
-              (remaining % 60 < 10 ? "0" : "") + String(remaining % 60) + "</td>";
-    } else {
-      html += "<td class='off'>OFF</td><td>-</td>";
-    }
-    html += "<td>" + String(dailyWateredMin[i]) + "/" + String(DAILY_LIMIT_MIN) + "p</td></tr>";
-  }
-  html += "</table>";
-  
-  // Queue
-  if (zoneQueueCount > 0) {
-    html += "<p>Sorban: ";
-    for (int i = 0; i < zoneQueueCount; i++) {
-      if (i > 0) html += " &rarr; ";
-      html += "Z" + String(zoneQueue[i].zoneIdx + 1) + "(" + String(zoneQueue[i].duration) + "p)";
-    }
-    html += "</p>";
-  }
-  html += "</div>";
-  
-  // Időjárás
-  html += "<div class='card'><h2>Idojaras</h2>";
-  if (weatherChecked) {
-    html += "<p>Eső: " + String(todayRainMm, 1) + "mm / " + String(todayRainProb) + "%";
-    html += " | Min: " + String(todayMinTemp, 1) + "&deg;C";
-    if (isRainyDay) html += " | 🌧 ESŐS";
-    if (isFrostDay) html += " | ❄️ FAGY";
-    html += "</p>";
-  }
-  if (!isnan(dhtTemp)) {
-    html += "<p>Panel: " + String((int)dhtTemp) + "&deg;C " + String((int)dhtHum) + "%</p>";
-  }
-  float smult = seasonalMultiplier();
-  html += "<p>Szezon: " + String((int)(smult * 100)) + "%</p>";
-  html += "</div>";
-  
-  // Rendszer
-  html += "<div class='card'><h2>Rendszer</h2>";
-  html += "<p>IP: " + WiFi.localIP().toString() + " | WiFi: " + String(WiFi.RSSI()) + " dBm</p>";
-  html += "<p>Heap: " + String(ESP.getFreeHeap() / 1024) + " kB | Uptime: " + uptimeStr() + "</p>";
-  html += "<p>NTP: " + String(ntpSynced ? "OK" : "N/A") + " | FW: " + currentVersion + "</p>";
-  html += "</div>";
-  
-  // Napló utolsó 10
-  if (logCount > 0) {
-    html += "<div class='card'><h2>Naplo (utolso 10)</h2><table>";
-    html += "<tr><th>Ido</th><th>Zona</th><th>Eredmeny</th></tr>";
-    int showCount = min(logCount, 10);
-    int startIdx = (logCount < LOG_MAX_ENTRIES) ? logCount - showCount : logHead - showCount;
-    if (startIdx < 0) startIdx += LOG_MAX_ENTRIES;
-    for (int i = 0; i < showCount; i++) {
-      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-      html += "<tr><td>" + String(logEntries[idx].month) + "." + String(logEntries[idx].day) + " ";
-      html += String(logEntries[idx].hour) + ":" + (logEntries[idx].min < 10 ? "0" : "") + String(logEntries[idx].min);
-      html += "</td><td>Z" + String(logEntries[idx].zone) + "</td>";
-      if (logEntries[idx].skipped) {
-        html += "<td class='off'>SKIP: " + logEntries[idx].reason + "</td>";
-      } else {
-        html += "<td class='on'>" + String(logEntries[idx].duration) + "p</td>";
-      }
-      html += "</tr>";
-    }
-    html += "</table></div>";
-  }
-  
-  html += "<p style='text-align:center;color:#666'>Auto-refresh: 10s</p>";
-  html += "<meta http-equiv='refresh' content='10'>";
-  html += "</body></html>";
-  webServer.send(200, "text/html", html);
-}
-
-void handleWebLog() {
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  html += "<title>Naplo</title><style>";
-  html += "body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:0;padding:10px}";
-  html += "table{border-collapse:collapse;width:100%}th,td{border:1px solid #333;padding:6px}";
-  html += "th{background:#0f3460}a{color:#e94560}</style></head><body>";
-  html += "<h2>Ontozesi naplo</h2><p><a href='/'>Vissza</a></p>";
-  html += "<table><tr><th>Datum</th><th>Zona</th><th>Perc</th><th>Status</th></tr>";
-  
-  int startIdx = (logCount < LOG_MAX_ENTRIES) ? 0 : logHead;
-  for (int i = 0; i < logCount; i++) {
-    int idx = (startIdx + i) % LOG_MAX_ENTRIES;
-    html += "<tr><td>" + String(logEntries[idx].month) + "." + String(logEntries[idx].day) + " ";
-    html += String(logEntries[idx].hour) + ":" + (logEntries[idx].min < 10 ? "0" : "") + String(logEntries[idx].min);
-    html += "</td><td>Z" + String(logEntries[idx].zone) + "</td>";
-    if (logEntries[idx].skipped) {
-      html += "<td>-</td><td style='color:#f00'>" + logEntries[idx].reason + "</td>";
-    } else {
-      html += "<td>" + String(logEntries[idx].duration) + "p</td><td style='color:#0f0'>OK</td>";
-    }
-    html += "</tr>";
-  }
-  html += "</table></body></html>";
-  webServer.send(200, "text/html", html);
-}
-
 // ==================== SETUP & LOOP ====================
 
 void setup() {
@@ -1992,13 +1866,7 @@ void setup() {
     checkWeather();
   }
   
-  // Web interface
-  webServer.on("/", handleWebRoot);
-  webServer.on("/log", handleWebLog);
-  webServer.begin();
-  Serial.println("Web server elindult (port " + String(WEB_PORT) + ")");
-  
-  Serial.println("Setup kész! (v1.3.6)");
+  Serial.println("Setup kész! (v1.2.0)");
 }
 
 void loop() {
@@ -2106,9 +1974,6 @@ void loop() {
       wifiConnected = true;
     }
   }
-  
-  // Web interface
-  webServer.handleClient();
   
   delay(10);
 }
