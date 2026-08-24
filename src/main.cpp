@@ -89,7 +89,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.4"
+#define FIRMWARE_VERSION  "1.3.5"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -112,6 +112,13 @@
 
 // Zóna sorrend (queue) — csak egy zóna egyszerre
 #define ZONE_QUEUE_SIZE 8
+
+// Öntözési napló (LittleFS)
+#define LOG_MAX_ENTRIES 50
+#define LOG_FILE "/waterlog.json"
+
+// Vízfogyasztás becslés (liter/perc)
+#define DEFAULT_FLOW_RATE 8.0
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -207,6 +214,21 @@ struct ZoneQueueItem {
 };
 ZoneQueueItem zoneQueue[ZONE_QUEUE_SIZE];
 int zoneQueueCount = 0;
+
+// Öntözési napló (ring buffer)
+struct LogEntry {
+  int zone;
+  int duration;
+  int day;
+  int month;
+  int hour;
+  int min;
+  bool skipped;
+  String reason;
+};
+LogEntry logEntries[LOG_MAX_ENTRIES];
+int logCount = 0;
+int logHead = 0;
 
 // ==================== IDŐJÁRÁS ====================
 
@@ -340,6 +362,85 @@ String nextScheduleTime(int zoneIdx) {
     return String(buf);
   }
   return "---";
+}
+
+// Öntözési napló függvények
+void addLogEntry(int zone, int duration, bool skipped, const String& reason) {
+  LogEntry entry;
+  entry.zone = zone;
+  entry.duration = duration;
+  entry.skipped = skipped;
+  entry.reason = reason;
+  
+  if (ntpSynced) {
+    time_t now = time(nullptr);
+    struct tm *tm = localtime(&now);
+    entry.day = tm->tm_mday;
+    entry.month = tm->tm_mon + 1;
+    entry.hour = tm->tm_hour;
+    entry.min = tm->tm_min;
+  } else {
+    entry.day = entry.month = entry.hour = entry.min = 0;
+  }
+  
+  logEntries[logHead] = entry;
+  logHead = (logHead + 1) % LOG_MAX_ENTRIES;
+  if (logCount < LOG_MAX_ENTRIES) logCount++;
+}
+
+void saveLog() {
+  if (logCount == 0) return;
+  // Kicsi doc — csak a legutóbbi 20 bejegyzést mentjük
+  DynamicJsonDocument doc(3072);
+  JsonArray arr = doc.to<JsonArray>();
+  
+  int saveCount = min(logCount, 20);
+  int startIdx = (logCount < LOG_MAX_ENTRIES) ? logCount - saveCount : logHead - saveCount;
+  if (startIdx < 0) startIdx += LOG_MAX_ENTRIES;
+  
+  for (int i = 0; i < saveCount; i++) {
+    int idx = (startIdx + i) % LOG_MAX_ENTRIES;
+    JsonObject e = arr.createNestedObject();
+    e["z"] = logEntries[idx].zone;
+    e["d"] = logEntries[idx].duration;
+    e["sk"] = logEntries[idx].skipped ? 1 : 0;
+    e["r"] = logEntries[idx].reason;
+    e["dy"] = logEntries[idx].day;
+    e["mo"] = logEntries[idx].month;
+    e["h"] = logEntries[idx].hour;
+    e["mi"] = logEntries[idx].min;
+  }
+  
+  File f = LittleFS.open(LOG_FILE, "w");
+  serializeJson(doc, f);
+  f.close();
+}
+
+void loadLog() {
+  File f = LittleFS.open(LOG_FILE, "r");
+  if (!f) return;
+  DynamicJsonDocument doc(3072);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return;
+  
+  JsonArray arr = doc.as<JsonArray>();
+  logCount = 0;
+  logHead = 0;
+  for (JsonObject e : arr) {
+    if (logCount >= LOG_MAX_ENTRIES) break;
+    logEntries[logHead].zone = e["z"] | 1;
+    logEntries[logHead].duration = e["d"] | 0;
+    logEntries[logHead].skipped = e["sk"] | 0;
+    logEntries[logHead].reason = e["r"] | "";
+    logEntries[logHead].day = e["dy"] | 0;
+    logEntries[logHead].month = e["mo"] | 0;
+    logEntries[logHead].hour = e["h"] | 0;
+    logEntries[logHead].min = e["mi"] | 0;
+    logHead = (logHead + 1) % LOG_MAX_ENTRIES;
+    logCount++;
+  }
+  Serial.println("Napló betöltve: " + String(logCount) + " bejegyzés");
 }
 
 // Zóna queue függvények
@@ -753,6 +854,7 @@ void startZone(int zoneIdx, int minutes) {
   sendTelegram(msg);
   updateBlynkStatus();
   wakeOled();
+  addLogEntry(zoneIdx + 1, minutes, false, "");
 }
 
 void stopZone(int zoneIdx) {
@@ -838,6 +940,7 @@ void checkSchedule() {
           if (!isnan(dhtTemp)) frostMsg += " | Panel: " + String(dhtTemp, 1) + "°C";
           sendTelegram(frostMsg, true);
           Serial.println("Faggyvédelem: skip öntözés (Z" + String(i + 1) + ")");
+          addLogEntry(i + 1, zones[i].schedules[s].duration, true, "faggy");
           break;
         }
         // Szezonális módosítás: télen nem öntöz
@@ -1285,7 +1388,9 @@ String getHelpText(bool isAdmin) {
     h += "/reboot — Újraindítás\n";
     h += "/flash — FLASH gomb debug\n";
     h += "/wake — OLED ébresztése\n";
-    h += "/weather — Időjárás info\n";
+    h += "/weather — Időjárás info (admin)\n";
+    h += "/log — Öntözési napló (admin)\n";
+    h += "/stats — Statisztika (admin)\n";
   }
   return h;
 }
@@ -1491,6 +1596,82 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     return;
   }
   
+  // Öntözési napló
+  if (text == "/log" && isAdmin) {
+    if (logCount == 0) {
+      bot.sendMessage(chatId, "📋 Még nincs naplóbejegyzés.", "");
+      return;
+    }
+    String msg = "📋 *Öntözési napló (utolsó 10)*\n\n";
+    int showCount = min(logCount, 10);
+    int startIdx = (logCount < LOG_MAX_ENTRIES) ? logCount - showCount : logHead - showCount;
+    if (startIdx < 0) startIdx += LOG_MAX_ENTRIES;
+    
+    for (int i = 0; i < showCount; i++) {
+      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
+      msg += String(logEntries[idx].day) + "." + String(logEntries[idx].month) + " ";
+      msg += String(logEntries[idx].hour) + ":" + 
+             (logEntries[idx].min < 10 ? "0" : "") + String(logEntries[idx].min);
+      msg += " Z" + String(logEntries[idx].zone);
+      if (logEntries[idx].skipped) {
+        msg += " ❌ " + logEntries[idx].reason;
+      } else {
+        msg += " 💧 " + String(logEntries[idx].duration) + "p";
+      }
+      msg += "\n";
+    }
+    bot.sendMessage(chatId, msg, "Markdown");
+    return;
+  }
+  
+  // Statisztika
+  if (text == "/stats" && isAdmin) {
+    if (logCount == 0) {
+      bot.sendMessage(chatId, "📊 Még nincs adat a statisztikához.", "");
+      return;
+    }
+    
+    int totalWatered = 0;
+    int totalSkipped = 0;
+    int totalMinutes = 0;
+    int currentMonth = 0;
+    
+    if (ntpSynced) {
+      time_t now = time(nullptr);
+      struct tm *tm = localtime(&now);
+      currentMonth = tm->tm_mon + 1;
+    }
+    
+    // Csak a jelenlegi hónap bejegyzéseit számoljuk
+    int startIdx = (logCount < LOG_MAX_ENTRIES) ? 0 : logHead;
+    for (int i = 0; i < logCount; i++) {
+      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
+      if (currentMonth > 0 && logEntries[idx].month != currentMonth) continue;
+      
+      if (logEntries[idx].skipped) {
+        totalSkipped++;
+      } else {
+        totalWatered++;
+        totalMinutes += logEntries[idx].duration;
+      }
+    }
+    
+    float waterLiters = totalMinutes * DEFAULT_FLOW_RATE;
+    
+    String msg = "📊 *Havi statisztika*\n\n";
+    msg += "💧 Öntözések: " + String(totalWatered) + "\n";
+    msg += "❌ Kihagyva: " + String(totalSkipped) + "\n";
+    msg += "⏱ Összes: " + String(totalMinutes) + " perc\n";
+    msg += "💧 Becsült fogyasztás: ~" + String((int)waterLiters) + " liter\n";
+    msg += "\n📊 Napi limit:\n";
+    for (int i = 0; i < NUM_ZONES; i++) {
+      msg += "Z" + String(i + 1) + ": " + String(dailyWateredMin[i]) + "/" + 
+             String(DAILY_LIMIT_MIN) + "p\n";
+    }
+    bot.sendMessage(chatId, msg, "Markdown");
+    return;
+  }
+  
   bot.sendMessage(chatId, "Ismeretlen parancs. /help", "");
 }
 
@@ -1578,6 +1759,7 @@ void setup() {
   // LittleFS
   LittleFS.begin();
   loadSchedule();
+  loadLog();
   
   // OLED inicializálás (Ideaspark v2.1: SDA=GPIO12, SCL=GPIO14)
   Wire.begin(12, 14);  // SDA=D6/GPIO12, SCL=D5/GPIO14
@@ -1665,6 +1847,8 @@ void setup() {
     cmds += "{\"command\":\"set\",\"description\":\"Ütemezés (admin)\"},";
     cmds += "{\"command\":\"clear\",\"description\":\"Ütemezés törlése (admin)\"},";
     cmds += "{\"command\":\"weather\",\"description\":\"Időjárás info (admin)\"},";
+    cmds += "{\"command\":\"log\",\"description\":\"Öntözési napló (admin)\"},";
+    cmds += "{\"command\":\"stats\",\"description\":\"Statisztika (admin)\"},";
     cmds += "{\"command\":\"upgrade\",\"description\":\"Firmware frissítés (admin)\"},";
     cmds += "{\"command\":\"reboot\",\"description\":\"Újraindítás (admin)\"},";
     cmds += "{\"command\":\"flash\",\"description\":\"FLASH gomb debug (admin)\"},";
@@ -1767,6 +1951,13 @@ void loop() {
   
   // Pending water kérdés timeout (10 perc → auto öntöz)
   checkPendingWaterTimeout();
+  
+  // Napló mentése 5 percenként
+  static unsigned long lastLogSave = 0;
+  if (now - lastLogSave > 300000) {
+    lastLogSave = now;
+    saveLog();
+  }
   
   // OLED frissítés (1 másodpercenként) — csak ha nem alszik
   if (oledPresent && !oledSleeping && now - lastOledUpdate > 1000) {
