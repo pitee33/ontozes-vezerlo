@@ -89,7 +89,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.2"
+#define FIRMWARE_VERSION  "1.3.3"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -106,6 +106,9 @@
 
 // Szezonális módosítás (duration multiplier hónap alapján)
 // Tavasz (3-5): 0.8x, Nyár (6-8): 1.3x, Ősz (9-10): 0.7x, Tél (11-2): 0.0x (skip)
+
+// Maximum napi öntözés limit (perc/zóna/nap)
+#define DAILY_LIMIT_MIN 30
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -189,6 +192,10 @@ DHT dht(DHT_PIN, DHT_TYPE);
 float dhtTemp = NAN;
 float dhtHum = NAN;
 unsigned long lastDhtRead = 0;
+
+// Napi öntözés limit követése
+int dailyWateredMin[NUM_ZONES] = {0, 0, 0, 0};
+int dailyLogDate = -1;  // év napja (tm_yday), -1 = még nem inicializált
 
 // ==================== IDŐJÁRÁS ====================
 
@@ -321,6 +328,24 @@ String nextScheduleTime(int zoneIdx) {
     return String(buf);
   }
   return "---";
+}
+
+// Napi limit reset (éjfélkor — új nap detektálás)
+void checkDailyReset() {
+  if (!ntpSynced) return;
+  time_t now = time(nullptr);
+  struct tm *tm = localtime(&now);
+  int todayDay = tm->tm_yday;  // 0-365
+  
+  if (dailyLogDate != todayDay) {
+    if (dailyLogDate >= 0) {
+      Serial.println("Napi limit reset (új nap)");
+    }
+    dailyLogDate = todayDay;
+    for (int i = 0; i < NUM_ZONES; i++) {
+      dailyWateredMin[i] = 0;
+    }
+  }
 }
 
 // Szezonális duration multiplier hónap alapján
@@ -627,6 +652,24 @@ void loadSchedule() {
 
 void startZone(int zoneIdx, int minutes) {
   if (zoneIdx < 0 || zoneIdx >= NUM_ZONES) return;
+  
+  // Napi limit ellenőrzés
+  if (dailyWateredMin[zoneIdx] + minutes > DAILY_LIMIT_MIN) {
+    int remaining = DAILY_LIMIT_MIN - dailyWateredMin[zoneIdx];
+    if (remaining <= 0) {
+      String msg = "⚠️ Zone " + String(zoneIdx + 1) + " elérte a napi limitet (" +
+                   String(DAILY_LIMIT_MIN) + "p). Öntözés kihagyva.";
+      sendTelegram(msg, true);
+      Serial.println("Napi limit elérve (Z" + String(zoneIdx + 1) + ")");
+      return;
+    }
+    // Rövidítjük a maradékra
+    String msg = "⚠️ Zone " + String(zoneIdx + 1) + " napi limit közel — " +
+                 String(minutes) + "p → " + String(remaining) + "p";
+    sendTelegram(msg, true);
+    minutes = remaining;
+  }
+  
   zones[zoneIdx].active = true;
   zones[zoneIdx].startTime = millis();
   zones[zoneIdx].durationMinutes = minutes;
@@ -641,6 +684,15 @@ void startZone(int zoneIdx, int minutes) {
 
 void stopZone(int zoneIdx) {
   if (zoneIdx < 0 || zoneIdx >= NUM_ZONES) return;
+  
+  // Napi limithez hozzáadjuk az eltelt időt
+  if (zones[zoneIdx].active) {
+    unsigned long elapsed = (millis() - zones[zoneIdx].startTime) / 1000 / 60;
+    dailyWateredMin[zoneIdx] += (int)elapsed;
+    Serial.printf("Z%d napi öntözés: %d/%d perc\n", zoneIdx + 1, 
+                  dailyWateredMin[zoneIdx], DAILY_LIMIT_MIN);
+  }
+  
   zones[zoneIdx].active = false;
   digitalWrite(zones[zoneIdx].pin, RELAY_OFF);
   
@@ -1118,6 +1170,13 @@ String getStatusText() {
   } else if (smult != 1.0) {
     txt += "\n🌿 Szezon: " + String((int)(smult * 100)) + "%";
   }
+  // Napi limit info
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (dailyWateredMin[i] > 0) {
+      txt += "\n📊 Z" + String(i + 1) + " ma: " + String(dailyWateredMin[i]) + 
+             "/" + String(DAILY_LIMIT_MIN) + "p";
+    }
+  }
   return txt;
 }
 
@@ -1569,6 +1628,9 @@ void loop() {
   
   // Futó zónák ellenőrzése
   checkRunningZones();
+  
+  // Napi limit reset (éjfélkor)
+  checkDailyReset();
   
   // Ütemezés ellenőrzése (1 másodpercenként)
   if (now - lastScheduleCheck > 1000) {
