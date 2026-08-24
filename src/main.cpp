@@ -89,17 +89,20 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.2.1"
+#define FIRMWARE_VERSION  "1.3.1"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
 // Időjárás (Open-Meteo — HTTP, ingyenes, nem kell API kulcs)
 // Törökbálint: 47.28°N, 18.92°E
-#define WEATHER_URL "http://api.open-meteo.com/v1/forecast?latitude=47.28&longitude=18.92&daily=precipitation_sum,precipitation_probability_max&timezone=Europe/Budapest&forecast_days=1"
+#define WEATHER_URL "http://api.open-meteo.com/v1/forecast?latitude=47.28&longitude=18.92&daily=precipitation_sum,precipitation_probability_max,temperature_2m_min&timezone=Europe/Budapest&forecast_days=1"
 #define WEATHER_CHECK_MS 1800000UL  // 30 perc
 #define RAIN_THRESHOLD_MM 1.0      // >1mm eső = esős nap
 #define RAIN_THRESHOLD_PROB 50     // >50% valószínűség = esős
 #define WATER_TIMEOUT_MS 1800000UL  // 30 perc válasz nélkül → auto öntöz
+
+// Faggyvédelem
+#define FROST_THRESHOLD 5.0        // <5°C → faggyvédelem
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -189,8 +192,10 @@ unsigned long lastDhtRead = 0;
 // Időjárás adatok
 float todayRainMm = 0.0;       // Mai eső mennyiség (mm)
 int todayRainProb = 0;         // Mai eső valószínűség (%)
+float todayMinTemp = 99.0;     // Mai minimum hőmérséklet (°C)
 bool weatherChecked = false;   // Sikerült-e lekérni
 bool isRainyDay = false;        // Esős nap-e
+bool isFrostDay = false;        // Faggyveszélyes nap-e
 
 // Pending locsolás kérdés (inline gombos)
 struct PendingWater {
@@ -662,12 +667,27 @@ void checkSchedule() {
       
       // 30 perccel előbb kérdez (csak ha nincs már aktív kérdés)
       if (curTotalMin == schedTotalMin - 30 && !pendingWater.active) {
+        // Faggyvédelem: ne zavarjon feleslegesen
+        if (isFrostDay) {
+          Serial.println("Faggyvédelem: skip kérdés (túl hideg)");
+          break;
+        }
         askWaterQuestion(i, zones[i].schedules[s].duration, s, schedH, schedM);
         break;
       }
       
       // Ütemezett időpontban: ha nincs pending kérdés → simán öntöz
       if (curHour == schedH && curMin == schedM && !pendingWater.active) {
+        // Faggyvédelem: nem öntöz fagyveszélyes napon
+        if (isFrostDay) {
+          String frostMsg = "❄️ Faggyvédelem — öntözés kihagyva (Z" + 
+                            String(i + 1) + ")\n";
+          frostMsg += "Min hő: " + String(todayMinTemp, 1) + "°C";
+          if (!isnan(dhtTemp)) frostMsg += " | Panel: " + String(dhtTemp, 1) + "°C";
+          sendTelegram(frostMsg, true);
+          Serial.println("Faggyvédelem: skip öntözés (Z" + String(i + 1) + ")");
+          break;
+        }
         startZone(i, zones[i].schedules[s].duration);
         break;
       }
@@ -724,11 +744,23 @@ void checkWeather() {
   todayRainProb = precipProb[0].as<int>();
   weatherChecked = true;
   
+  // Minimum hőmérséklet (faggyvédelem)
+  JsonArray tempMin = daily["temperature_2m_min"];
+  if (!tempMin.isNull()) {
+    todayMinTemp = tempMin[0].as<float>();
+  }
+  
   // Esős nap ha >1mm eső vagy >50% valószínűség
   isRainyDay = (todayRainMm >= RAIN_THRESHOLD_MM || todayRainProb >= RAIN_THRESHOLD_PROB);
   
-  Serial.printf("Weather: %.1fmm, %d%% prob -> %s\n", 
-                todayRainMm, todayRainProb, isRainyDay ? "ESŐS" : "száraz");
+  // Faggyveszély: min temp <5°C VAGY panel DHT <5°C
+  isFrostDay = (todayMinTemp < FROST_THRESHOLD || 
+                (!isnan(dhtTemp) && dhtTemp < FROST_THRESHOLD));
+  
+  Serial.printf("Weather: %.1fmm, %d%% prob, min %.1f°C -> %s %s\n", 
+                todayRainMm, todayRainProb, todayMinTemp,
+                isRainyDay ? "ESŐS" : "száraz",
+                isFrostDay ? "FAGY" : "");
 }
 
 // ==================== LOC SOLÁS KÉRDÉS ====================
@@ -1046,6 +1078,8 @@ String getStatusText() {
   if (weatherChecked) {
     txt += "🌤 " + String(todayRainMm, 1) + "mm/" + String(todayRainProb) + "% ";
     txt += isRainyDay ? "(esős)" : "(száraz)";
+    txt += " | Min: " + String(todayMinTemp, 1) + "°C";
+    if (isFrostDay) txt += " ❄️FAGY";
   }
   return txt;
 }
@@ -1264,8 +1298,15 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     String msg = "🌤 *Időjárás (Törökbálint)*\n";
     msg += "Eső ma: " + String(todayRainMm, 1) + " mm\n";
     msg += "Eső valószínű: " + String(todayRainProb) + "%\n";
-    msg += "Státusz: " + String(isRainyDay ? "🌧 ESŐS nap" : "☀️ Száraz nap") + "\n\n";
-    msg += "Locsolás: " + String(isRainyDay ? "kérdezni fog" : "automatikus");
+    msg += "Min hő: " + String(todayMinTemp, 1) + "°C\n";
+    msg += "Státusz: " + String(isRainyDay ? "🌧 ESŐS nap" : "☀️ Száraz nap");
+    if (isFrostDay) msg += " + ❄️ FAGY";
+    msg += "\n\n";
+    if (isFrostDay) {
+      msg += "Locsolás: ❄️ faggyvédelem — kihagyva";
+    } else {
+      msg += "Locsolás: " + String(isRainyDay ? "kérdezni fog" : "automatikus");
+    }
     bot.sendMessage(chatId, msg, "Markdown");
     return;
   }
