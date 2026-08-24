@@ -89,7 +89,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.3"
+#define FIRMWARE_VERSION  "1.3.4"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -109,6 +109,9 @@
 
 // Maximum napi öntözés limit (perc/zóna/nap)
 #define DAILY_LIMIT_MIN 30
+
+// Zóna sorrend (queue) — csak egy zóna egyszerre
+#define ZONE_QUEUE_SIZE 8
 
 // Blynk virtual pin-ek (4 zóna + státusz)
 #define VPIN_ZONE1    V1
@@ -197,6 +200,14 @@ unsigned long lastDhtRead = 0;
 int dailyWateredMin[NUM_ZONES] = {0, 0, 0, 0};
 int dailyLogDate = -1;  // év napja (tm_yday), -1 = még nem inicializált
 
+// Zóna sorrend (queue)
+struct ZoneQueueItem {
+  int zoneIdx;
+  int duration;
+};
+ZoneQueueItem zoneQueue[ZONE_QUEUE_SIZE];
+int zoneQueueCount = 0;
+
 // ==================== IDŐJÁRÁS ====================
 
 // Időjárás adatok
@@ -254,6 +265,7 @@ void checkOledSleep() {
 }
 
 // Forward declaration
+void startZone(int zoneIdx, int minutes);
 void askWaterQuestion(int zoneIdx, int duration, int schedSlot, int schedHour, int schedMin);
 void handleCallbackQuery(String callbackData, String chatId, String messageId);
 
@@ -328,6 +340,52 @@ String nextScheduleTime(int zoneIdx) {
     return String(buf);
   }
   return "---";
+}
+
+// Zóna queue függvények
+bool isAnyZoneRunning() {
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (zones[i].active) return true;
+  }
+  return false;
+}
+
+void addToQueue(int zoneIdx, int duration) {
+  if (zoneQueueCount >= ZONE_QUEUE_SIZE) {
+    Serial.println("Queue tele — eldobva");
+    return;
+  }
+  // Ne duplázzuk ugyanazt a zónát
+  for (int i = 0; i < zoneQueueCount; i++) {
+    if (zoneQueue[i].zoneIdx == zoneIdx) {
+      Serial.println("Zóna már a sorban — frissítve");
+      zoneQueue[i].duration = duration;
+      return;
+    }
+  }
+  zoneQueue[zoneQueueCount].zoneIdx = zoneIdx;
+  zoneQueue[zoneQueueCount].duration = duration;
+  zoneQueueCount++;
+  Serial.println("Z" + String(zoneIdx + 1) + " queue-ba téve (" + 
+                 String(zoneQueueCount) + " a sorban)");
+}
+
+void processQueue() {
+  if (zoneQueueCount == 0) return;
+  if (isAnyZoneRunning()) return;  // várok amíg a futó leáll
+  
+  // Első elem kivenni
+  int z = zoneQueue[0].zoneIdx;
+  int d = zoneQueue[0].duration;
+  
+  // Sor balra tolása
+  for (int i = 0; i < zoneQueueCount - 1; i++) {
+    zoneQueue[i] = zoneQueue[i + 1];
+  }
+  zoneQueueCount--;
+  
+  Serial.println("Queue: Z" + String(z + 1) + " indítása (" + String(d) + "p)");
+  startZone(z, d);
 }
 
 // Napi limit reset (éjfélkor — új nap detektálás)
@@ -653,6 +711,21 @@ void loadSchedule() {
 void startZone(int zoneIdx, int minutes) {
   if (zoneIdx < 0 || zoneIdx >= NUM_ZONES) return;
   
+  // Ha ez a zóna már fut → nem indítjuk újra
+  if (zones[zoneIdx].active) {
+    Serial.println("Z" + String(zoneIdx + 1) + " már fut — skip");
+    return;
+  }
+  
+  // Ha másik zóna fut → queue-ba tesszük
+  if (isAnyZoneRunning()) {
+    addToQueue(zoneIdx, minutes);
+    String msg = "📋 Zone " + String(zoneIdx + 1) + " sorba téve (" + 
+                 String(minutes) + "p) — vár amíg a futó zóna befejeződik";
+    sendTelegram(msg, true);
+    return;
+  }
+  
   // Napi limit ellenőrzés
   if (dailyWateredMin[zoneIdx] + minutes > DAILY_LIMIT_MIN) {
     int remaining = DAILY_LIMIT_MIN - dailyWateredMin[zoneIdx];
@@ -700,6 +773,9 @@ void stopZone(int zoneIdx) {
   sendTelegram(msg);
   updateBlynkStatus();
   wakeOled();
+  
+  // Queue következő elemének indítása
+  processQueue();
 }
 
 void stopAllZones() {
@@ -1175,6 +1251,14 @@ String getStatusText() {
     if (dailyWateredMin[i] > 0) {
       txt += "\n📊 Z" + String(i + 1) + " ma: " + String(dailyWateredMin[i]) + 
              "/" + String(DAILY_LIMIT_MIN) + "p";
+    }
+  }
+  // Queue info
+  if (zoneQueueCount > 0) {
+    txt += "\n📋 Sorban: ";
+    for (int i = 0; i < zoneQueueCount; i++) {
+      if (i > 0) txt += " → ";
+      txt += "Z" + String(zoneQueue[i].zoneIdx + 1) + "(" + String(zoneQueue[i].duration) + "p)";
     }
   }
   return txt;
