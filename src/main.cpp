@@ -1,6 +1,6 @@
 /*
- * Öntözésvezérlés ESP8266 + Telegram + Blynk
- * FW v1.1.0 — OLED sleep, FLASH gomb ébresztés, több ütemezés/zóna
+ * Öntözésvezérlés ESP8266 + Telegram
+ * FW v1.4.0 — Blynk removed, web interface added
  *
  * Hardware:
  *   - Wemos D1 Mini (ESP8266)
@@ -17,8 +17,7 @@
  *   - OLED kikapcsolása 2 perc inaktivitás után
  *   - FLASH gomb ébreszti az OLED-et
  *   - 2 Telegram bot (Admin + Admin2)
- *   - Blynk dashboard
- *   - Hardware Watchdog
+  *   - Hardware Watchdog
  *   - Auto firmware check (GitHub publikus repó)
  *   - OTA update Telegram-ból
  */
@@ -30,10 +29,6 @@
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
 
-// Blynk template define-ok az include ELŐTT kell
-#define BLYNK_TEMPLATE_ID   "TMPL2D8e2u0UL"
-#define BLYNK_TEMPLATE_NAME "Ontozes"
-#include <BlynkSimpleEsp8266.h>
 
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
@@ -57,8 +52,6 @@
 #define BOT_TOKEN_FAMILY  "8824963625:AAGecULECaM03134n7ejlOAs8xB5ytoR4mk"
 #define FAMILY_CHAT_ID    "8853524984"
 
-// Blynk — template define-ok az include-nál (fent)
-#define BLYNK_AUTH_TOKEN    "yZ2fyi267XuP3ZHqlHqW76xvmt9bCc5O"
 
 // Relé board (aktív magas — HIGH = be, LOW = ki)
 // FIGYELEM: Z3 áthelyezve D3-ról D0-ra (GPIO0 felszabadítva FLASH gombnak)
@@ -89,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.3.7"
+#define FIRMWARE_VERSION  "1.4.0"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -120,13 +113,9 @@
 // Vízfogyasztás becslés (liter/perc)
 #define DEFAULT_FLOW_RATE 8.0
 
-// Blynk virtual pin-ek (4 zóna + státusz)
-#define VPIN_ZONE1    V1
-#define VPIN_ZONE2    V2
-#define VPIN_ZONE3    V3
-#define VPIN_ZONE4    V4
-#define VPIN_STATUS   V5
-#define VPIN_SCHEDULE V6
+// Web interface
+#define WEB_PORT 80
+
 
 // ==================== GLOBÁLIS VÁLTOZÓK ====================
 
@@ -134,7 +123,6 @@ WiFiClientSecure securedClient;   // Admin bot
 WiFiClientSecure securedClient2; // 2. bot (külön SSL kapcsolat)
 UniversalTelegramBot botAdmin(BOT_TOKEN_ADMIN, securedClient);
 UniversalTelegramBot botFamily(BOT_TOKEN_FAMILY, securedClient2);
-BlynkTimer blynkTimer;
 
 // OLED
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
@@ -189,7 +177,6 @@ Zone zones[NUM_ZONES] = {
 unsigned long lastBotPoll = 0;
 unsigned long lastScheduleCheck = 0;
 unsigned long lastFirmwareCheck = 0;
-unsigned long lastBlynkUpdate = 0;
 unsigned long lastNtpSync = 0;
 unsigned long lastWeatherCheck = 0;
 
@@ -229,6 +216,9 @@ struct LogEntry {
 LogEntry logEntries[LOG_MAX_ENTRIES];
 int logCount = 0;
 int logHead = 0;
+
+// Web server
+ESP8266WebServer webServer(80);
 
 // ==================== IDŐJÁRÁS ====================
 
@@ -721,33 +711,6 @@ void sendTelegram(const String &msg, bool adminOnly = false) {
   ESP.wdtFeed();
 }
 
-// ==================== BLYNK ====================
-
-void updateBlynkStatus() {
-  Blynk.virtualWrite(VPIN_ZONE1, zones[0].active ? 1 : 0);
-  Blynk.virtualWrite(VPIN_ZONE2, zones[1].active ? 1 : 0);
-  Blynk.virtualWrite(VPIN_ZONE3, zones[2].active ? 1 : 0);
-  Blynk.virtualWrite(VPIN_ZONE4, zones[3].active ? 1 : 0);
-  String status = "Z1:" + String(zones[0].active ? "ON" : "OFF") + 
-                  " Z2:" + String(zones[1].active ? "ON" : "OFF") +
-                  " Z3:" + String(zones[2].active ? "ON" : "OFF") +
-                  " Z4:" + String(zones[3].active ? "ON" : "OFF");
-  Blynk.virtualWrite(VPIN_STATUS, status);
-  
-  String sched = "";
-  for (int i = 0; i < NUM_ZONES; i++) {
-    if (i > 0) sched += " | ";
-    sched += "Z" + String(i + 1) + ":";
-    int cnt = countSchedules(i);
-    if (cnt > 0) {
-      sched += String(cnt) + "x ";
-      sched += nextScheduleTime(i);
-    } else {
-      sched += "---";
-    }
-  }
-  Blynk.virtualWrite(VPIN_SCHEDULE, sched);
-}
 
 // ==================== ÜTEMEZÉS MENTÉS/BETÖLTÉS ====================
 
@@ -852,7 +815,6 @@ void startZone(int zoneIdx, int minutes) {
   String msg = "💧 Zone " + String(zoneIdx + 1) + " ELINDITVA (" + 
                String(minutes) + " perc)";
   sendTelegram(msg);
-  updateBlynkStatus();
   wakeOled();
   addLogEntry(zoneIdx + 1, minutes, false, "");
 }
@@ -873,7 +835,6 @@ void stopZone(int zoneIdx) {
   
   String msg = "✅ Zone " + String(zoneIdx + 1) + " LEALLITVA";
   sendTelegram(msg);
-  updateBlynkStatus();
   wakeOled();
   
   // Queue következő elemének indítása
@@ -1193,8 +1154,6 @@ void doOTAUpdate() {
   Serial.println("=== OTA START ===");
   botAdmin.sendMessage(ADMIN_CHAT_ID, "⏳ OTA indul...", "");
   
-  Blynk.disconnect();
-  delay(200);
   botAdmin.getUpdates(botAdmin.last_message_received + 1);
   securedClient.stop();
   securedClient2.stop();
@@ -1487,8 +1446,7 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
                      " ütemezve: " + String(h) + ":" + (m < 10 ? "0" : "") + String(m) + 
                      " (" + String(d) + " perc)";
         sendTelegram(msg);
-        updateBlynkStatus();
-        return;
+              return;
       }
     }
     bot.sendMessage(chatId, "Használat: /set <zone> <slot> <ora> <perc> <dur>\n"
@@ -1512,8 +1470,7 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
             saveSchedule();
             String msg = "🗑️ Zone " + String(z + 1) + " slot " + String(sl + 1) + " törölve";
             sendTelegram(msg);
-            updateBlynkStatus();
-            return;
+                      return;
           }
         } else {
           // All slots for this zone
@@ -1523,8 +1480,7 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
           saveSchedule();
           String msg = "🗑️ Zone " + String(z + 1) + " összes ütemezés törölve";
           sendTelegram(msg);
-          updateBlynkStatus();
-          return;
+                  return;
         }
       }
     }
@@ -1706,34 +1662,92 @@ void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool 
   }
 }
 
-// ==================== BLYNK HANDLERS ====================
 
-BLYNK_WRITE(VPIN_ZONE1) {
-  wakeOled();
-  int state = param.asInt();
-  if (state) startZone(0, 10);
-  else stopZone(0);
-}
+// ==================== WEB INTERFACE ====================
 
-BLYNK_WRITE(VPIN_ZONE2) {
-  wakeOled();
-  int state = param.asInt();
-  if (state) startZone(1, 10);
-  else stopZone(1);
-}
-
-BLYNK_WRITE(VPIN_ZONE3) {
-  wakeOled();
-  int state = param.asInt();
-  if (state) startZone(2, 10);
-  else stopZone(2);
-}
-
-BLYNK_WRITE(VPIN_ZONE4) {
-  wakeOled();
-  int state = param.asInt();
-  if (state) startZone(3, 10);
-  else stopZone(3);
+void handleWebRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Ontozes</title><style>";
+  html += "body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:0;padding:10px}";
+  html += "h1{color:#0f3460;background:#16213e;padding:10px;border-radius:5px}";
+  html += "table{border-collapse:collapse;width:100%;margin:10px 0}";
+  html += "th,td{border:1px solid #333;padding:6px;text-align:left}";
+  html += "th{background:#0f3460}.on{color:#0f0}.off{color:#f00}";
+  html += ".card{background:#16213e;padding:10px;border-radius:5px;margin:10px 0}";
+  html += "</style></head><body>";
+  html += "<h1>\xF0\x9F\x8C\xBF Ontozes v" + currentVersion + "</h1>";
+  
+  html += "<div class='card'><h2>Zonak</h2><table><tr><th>Zona</th><th>Allapot</th><th>Ido</th><th>Ma</th></tr>";
+  for (int i = 0; i < NUM_ZONES; i++) {
+    html += "<tr><td>Z" + String(i + 1) + "</td>";
+    if (zones[i].active) {
+      unsigned long elapsed = (millis() - zones[i].startTime) / 1000;
+      int remaining = zones[i].durationMinutes * 60 - elapsed;
+      if (remaining < 0) remaining = 0;
+      html += "<td class='on'>ON</td><td>" + String(remaining / 60) + ":" + 
+              (remaining % 60 < 10 ? "0" : "") + String(remaining % 60) + "</td>";
+    } else {
+      html += "<td class='off'>OFF</td><td>-</td>";
+    }
+    html += "<td>" + String(dailyWateredMin[i]) + "/" + String(DAILY_LIMIT_MIN) + "p</td></tr>";
+  }
+  html += "</table>";
+  if (zoneQueueCount > 0) {
+    html += "<p>Sorban: ";
+    for (int i = 0; i < zoneQueueCount; i++) {
+      if (i > 0) html += " > ";
+      html += "Z" + String(zoneQueue[i].zoneIdx + 1) + "(" + String(zoneQueue[i].duration) + "p)";
+    }
+    html += "</p>";
+  }
+  html += "</div>";
+  
+  html += "<div class='card'><h2>Idojaras</h2>";
+  if (weatherChecked) {
+    html += "<p>Eso: " + String(todayRainMm, 1) + "mm / " + String(todayRainProb) + "%";
+    html += " | Min: " + String(todayMinTemp, 1) + "C";
+    if (isRainyDay) html += " | ESOS";
+    if (isFrostDay) html += " | FAGY";
+    html += "</p>";
+  }
+  if (!isnan(dhtTemp)) {
+    html += "<p>Panel: " + String((int)dhtTemp) + "C " + String((int)dhtHum) + "%</p>";
+  }
+  html += "<p>Szezon: " + String((int)(seasonalMultiplier() * 100)) + "%</p>";
+  html += "</div>";
+  
+  html += "<div class='card'><h2>Rendszer</h2>";
+  html += "<p>IP: " + WiFi.localIP().toString() + " | WiFi: " + String(WiFi.RSSI()) + " dBm</p>";
+  html += "<p>Heap: " + String(ESP.getFreeHeap() / 1024) + " kB | Uptime: " + uptimeStr() + "</p>";
+  html += "<p>NTP: " + String(ntpSynced ? "OK" : "N/A") + "</p>";
+  html += "</div>";
+  
+  if (logCount > 0) {
+    html += "<div class='card'><h2>Naplo</h2><table>";
+    html += "<tr><th>Ido</th><th>Zona</th><th>Eredmeny</th></tr>";
+    int showCount = min(logCount, 10);
+    int startIdx = (logCount < LOG_MAX_ENTRIES) ? logCount - showCount : logHead - showCount;
+    if (startIdx < 0) startIdx += LOG_MAX_ENTRIES;
+    for (int i = 0; i < showCount; i++) {
+      int idx = (startIdx + i) % LOG_MAX_ENTRIES;
+      html += "<tr><td>" + String(logEntries[idx].month) + "." + String(logEntries[idx].day) + " ";
+      html += String(logEntries[idx].hour) + ":" + (logEntries[idx].min < 10 ? "0" : "") + String(logEntries[idx].min);
+      html += "</td><td>Z" + String(logEntries[idx].zone) + "</td>";
+      if (logEntries[idx].skipped) {
+        html += "<td class='off'>" + logEntries[idx].reason + "</td>";
+      } else {
+        html += "<td class='on'>" + String(logEntries[idx].duration) + "p</td>";
+      }
+      html += "</tr>";
+    }
+    html += "</table></div>";
+  }
+  
+  html += "<p style='text-align:center;color:#666'>Auto-refresh 10s</p>";
+  html += "<meta http-equiv='refresh' content='10'>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
 }
 
 // ==================== SETUP & LOOP ====================
@@ -1804,16 +1818,10 @@ void setup() {
   securedClient.setInsecure();
   securedClient2.setInsecure();
   
-  // Blynk
-  Blynk.config(BLYNK_AUTH_TOKEN);
   
   // NTP
   syncNTP();
   
-  // Blynk timer-ek
-  blynkTimer.setInterval(5000L, []() {
-    updateBlynkStatus();
-  });
   
   // Boot üzenet
   if (wifiConnected) {
@@ -1866,17 +1874,17 @@ void setup() {
     checkWeather();
   }
   
+    // Web interface
+  webServer.on("/", handleWebRoot);
+  webServer.begin();
+  Serial.println("Web server: port 80");
+  
   Serial.println("Setup kész! (v1.2.0)");
 }
 
 void loop() {
   ESP.wdtFeed();
   
-  // Blynk futás
-  if (wifiConnected) {
-    Blynk.run();
-  }
-  blynkTimer.run();
   
   // FLASH gomb ellenőrzés (OLED ébresztés)
   checkFlashButton();
@@ -1974,6 +1982,9 @@ void loop() {
       wifiConnected = true;
     }
   }
+  
+  // Web interface
+  webServer.handleClient();
   
   delay(10);
 }
