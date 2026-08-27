@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.4.1"
+#define FIRMWARE_VERSION  "1.4.2"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -988,9 +988,14 @@ String waterKeyboardJson() {
 
 // Kérdés felvétele: 30 perccel az ütemezett öntözés előtt
 void askWaterQuestion(int zoneIdx, int duration, int schedSlot, int schedHour, int schedMin) {
-  // Friss időjárás lekérés a döntés előtt
-  Serial.println("Ütemezett öntözés előtt — friss időjárás lekérés...");
-  checkWeather();
+  // Időjárás: csak frissítsük ha régebbi mint 10 perc
+  unsigned long now = millis();
+  if (!weatherChecked || (now - lastWeatherCheck > 600000)) {
+    Serial.println("Ütemezett öntözés előtt — friss időjárás lekérés...");
+    checkWeather();
+  } else {
+    Serial.println("Időjárás cache friss, használjuk");
+  }
   
   if (!weatherChecked) {
     Serial.println("Weather lekérés sikertelen — öntözés a tervezett időben");
