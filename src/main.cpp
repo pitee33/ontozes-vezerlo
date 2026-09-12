@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.4.2"
+#define FIRMWARE_VERSION  "1.5.0"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -236,6 +236,10 @@ struct PendingWater {
   bool waterYes;               // Igent mondott?
 };
 PendingWater pendingWater = { false, 0, 0, 0, 0, 0, false, false };
+
+// "Ma már megtörtént" jelzők — új napkor a checkDailyReset() nullázza
+bool schedFiredToday[NUM_ZONES][MAX_SCHEDULES] = {{false}};
+bool questionAskedToday[NUM_ZONES][MAX_SCHEDULES] = {{false}};
 
 // ==================== OLED SLEEP / WAKE ====================
 
@@ -487,6 +491,13 @@ void checkDailyReset() {
     dailyLogDate = todayDay;
     for (int i = 0; i < NUM_ZONES; i++) {
       dailyWateredMin[i] = 0;
+    }
+    // Ütemezés/lekérdezés jelzők nullázása új napon
+    for (int i = 0; i < NUM_ZONES; i++) {
+      for (int s = 0; s < MAX_SCHEDULES; s++) {
+        schedFiredToday[i][s] = false;
+        questionAskedToday[i][s] = false;
+      }
     }
   }
 }
@@ -862,29 +873,41 @@ void checkSchedule() {
   if (lastCheckedMinute == curMin) return;
   lastCheckedMinute = curMin;
   
+  int curTotalMin = curHour * 60 + curMin;
+  
   for (int i = 0; i < NUM_ZONES; i++) {
     if (zones[i].active) continue;
     for (int s = 0; s < MAX_SCHEDULES; s++) {
       if (!zones[i].schedules[s].enabled) continue;
+      if (schedFiredToday[i][s]) continue;
       
       int schedH = zones[i].schedules[s].hour;
       int schedM = zones[i].schedules[s].min;
       int schedTotalMin = schedH * 60 + schedM;
-      int curTotalMin = curHour * 60 + curMin;
       
-      // 30 perccel előbb kérdez (csak ha nincs már aktív kérdés)
-      if (curTotalMin == schedTotalMin - 30 && !pendingWater.active) {
+      // === ABLAK 1: kérdezés (ütemezés előtt 30p-tól, egyszer) ===
+      if (!questionAskedToday[i][s] && !pendingWater.active &&
+          curTotalMin >= schedTotalMin - 30 && curTotalMin < schedTotalMin) {
         // Faggyvédelem: ne zavarjon feleslegesen
         if (isFrostDay) {
           Serial.println("Faggyvédelem: skip kérdés (túl hideg)");
-          break;
+          questionAskedToday[i][s] = true;
+          continue;
         }
+        questionAskedToday[i][s] = true;
         askWaterQuestion(i, zones[i].schedules[s].duration, s, schedH, schedM);
-        break;
+        continue;
       }
       
-      // Ütemezett időpontban: ha nincs pending kérdés → simán öntöz
-      if (curHour == schedH && curMin == schedM && !pendingWater.active) {
+      // === ABLAK 2: indítás (ütemezett időpontban, egyszer) ===
+      if (curHour == schedH && curMin == schedM) {
+        // Ha van függő kérdés ERRŐL a zóna+slot-ról → a timeout dönt, ne itt
+        if (pendingWater.active && pendingWater.zoneIdx == i && 
+            pendingWater.schedSlot == s) {
+          schedFiredToday[i][s] = true;
+          continue;
+        }
+        schedFiredToday[i][s] = true;
         // Faggyvédelem: nem öntöz fagyveszélyes napon
         if (isFrostDay) {
           String frostMsg = "❄️ Faggyvédelem — öntözés kihagyva (Z" + 
@@ -894,17 +917,17 @@ void checkSchedule() {
           sendTelegram(frostMsg, true);
           Serial.println("Faggyvédelem: skip öntözés (Z" + String(i + 1) + ")");
           addLogEntry(i + 1, zones[i].schedules[s].duration, true, "faggy");
-          break;
+          continue;
         }
         // Szezonális módosítás: télen nem öntöz
         float mult = seasonalMultiplier();
         if (mult == 0.0) {
           Serial.println("Tél — öntözés kihagyva (Z" + String(i + 1) + ")");
-          break;
+          continue;
         }
         int adjDur = applySeasonalDuration(zones[i].schedules[s].duration);
         startZone(i, adjDur);
-        break;
+        continue;
       }
     }
   }
@@ -1074,6 +1097,11 @@ void checkPendingWaterTimeout() {
 // Callback query kezelése (inline gomb válasz)
 void handleCallbackQuery(String callbackData, String chatId, String messageId) {
   Serial.println("Callback: " + callbackData + " from " + chatId);
+  
+  // Gomb pörgésének leállítása (Telegram ACK)
+  // A query_id-t a getUpdates már eltárolta — keressük az utolsó üzenetben
+  // Egyszerűbb: answerCallbackQuery a bot messages tömbjéből
+  // (a hívó oldalon küldjük, itt csak a logika)
   
   if (!pendingWater.active) {
     botAdmin.sendMessage(chatId, "Ez a kérdés már lejárt.", "");
@@ -1647,8 +1675,11 @@ void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool 
       // Callback query (inline gomb válasz)
       if (messageType == "callback_query") {
         String callbackData = bot.messages[i].text;
+        String queryId = bot.messages[i].query_id;
         String messageId = String(bot.messages[i].message_id);
-        Serial.println("Callback: " + callbackData);
+        Serial.println("Callback: " + callbackData + " (id: " + queryId + ")");
+        // ACK — gomb pörgés leállítása a telefonon
+        bot.answerCallbackQuery(queryId, "");
         handleCallbackQuery(callbackData, chatId, messageId);
       } else {
         // Normál üzenet
