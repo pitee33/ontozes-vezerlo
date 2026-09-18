@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.5.0"
+#define FIRMWARE_VERSION  "1.6.0"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -240,6 +240,18 @@ PendingWater pendingWater = { false, 0, 0, 0, 0, 0, false, false };
 // "Ma már megtörtént" jelzők — új napkor a checkDailyReset() nullázza
 bool schedFiredToday[NUM_ZONES][MAX_SCHEDULES] = {{false}};
 bool questionAskedToday[NUM_ZONES][MAX_SCHEDULES] = {{false}};
+
+// Öntözési szezon főkapcsoló
+// SEASON_AUTO = hónap alapján automatikus (tavasz 0.8x, nyár 1.3x, ősz 0.7x, tél KI)
+// SEASON_ON   = mindig locsol (szezontól függetlenül, 1x szorzó)
+// SEASON_OFF  = sosem locsol ütemezés szerint (kézi /zoneX parancsok mennek)
+enum SeasonMode { SEASON_AUTO, SEASON_ON, SEASON_OFF };
+SeasonMode seasonMode = SEASON_AUTO;
+const char* seasonModeName() {
+  if (seasonMode == SEASON_ON)  return "BE";
+  if (seasonMode == SEASON_OFF) return "KI";
+  return "AUTO";
+}
 
 // ==================== OLED SLEEP / WAKE ====================
 
@@ -504,6 +516,10 @@ void checkDailyReset() {
 
 // Szezonális duration multiplier hónap alapján
 float seasonalMultiplier() {
+  // Kézi mód felülírja az automatikus döntést
+  if (seasonMode == SEASON_OFF) return 0.0;   // Szezon KI — sosem locsol ütemezés szerint
+  if (seasonMode == SEASON_ON)  return 1.0;   // Szezon BE — mindig locsol (1x szorzó)
+  // SEASON_AUTO: hónap alapján
   if (!ntpSynced) return 1.0;
   time_t now = time(nullptr);
   struct tm *tm = localtime(&now);
@@ -719,6 +735,7 @@ void sendTelegram(const String &msg, bool adminOnly = false) {
 
 void saveSchedule() {
   DynamicJsonDocument doc(2048);
+  doc["season"] = (int)seasonMode;  // Szezon főkapcsoló mentése
   for (int i = 0; i < NUM_ZONES; i++) {
     JsonArray arr = doc.createNestedArray("z" + String(i));
     for (int s = 0; s < MAX_SCHEDULES; s++) {
@@ -741,6 +758,13 @@ void loadSchedule() {
   DeserializationError err = deserializeJson(doc, f);
   f.close();
   if (err) return;
+  
+  // Szezon főkapcsoló betöltése (ha van mentve)
+  int sm = doc["season"] | 0;  // default: AUTO
+  if (sm == 1) seasonMode = SEASON_ON;
+  else if (sm == 2) seasonMode = SEASON_OFF;
+  else seasonMode = SEASON_AUTO;
+  Serial.println(String("Szezon mod: ") + seasonModeName());
   
   for (int i = 0; i < NUM_ZONES; i++) {
     String key = "z" + String(i);
@@ -888,6 +912,12 @@ void checkSchedule() {
       // === ABLAK 1: kérdezés (ütemezés előtt 30p-tól, egyszer) ===
       if (!questionAskedToday[i][s] && !pendingWater.active &&
           curTotalMin >= schedTotalMin - 30 && curTotalMin < schedTotalMin) {
+        // Szezon KI (tél vagy kézi KI) — ne is kérdezzen, úgysem locsol
+        if (seasonalMultiplier() == 0.0) {
+          questionAskedToday[i][s] = true;
+          Serial.println("Szezon KI — skip kérdés (Z" + String(i + 1) + ")");
+          continue;
+        }
         // Faggyvédelem: ne zavarjon feleslegesen
         if (isFrostDay) {
           Serial.println("Faggyvédelem: skip kérdés (túl hideg)");
@@ -1306,6 +1336,15 @@ String getStatusText() {
   } else {
     txt += "\n⚠️ NTP nincs szinkronizálva\n";
   }
+  // Szezon mód kijelzés
+  float mult = seasonalMultiplier();
+  txt += "🌿 Szezon: " + String(seasonModeName());
+  if (mult == 0.0) {
+    txt += " (ütemezett öntözés OFF)";
+  } else {
+    txt += " (" + String(mult, 1) + "x)";
+  }
+  txt += "\n";
   txt += "📦 FW: " + currentVersion + "\n";
   txt += "📶 WiFi: " + String(WiFi.RSSI()) + " dBm";
   int rssi = WiFi.RSSI();
@@ -1371,6 +1410,7 @@ String getHelpText(bool isAdmin) {
     h += "  pl: /clear 1 2 (csak slot 2)\n";
     h += "/upgrade — Firmware frissítés\n";
     h += "/reboot — Újraindítás\n";
+    h += "/season [auto|be|ki] — Szezon mód\n";
     h += "/flash — FLASH gomb debug\n";
     h += "/wake — OLED ébresztése\n";
     h += "/weather — Időjárás info (admin)\n";
@@ -1526,6 +1566,61 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
     bot.sendMessage(chatId, "🔄 Újraindítás...", "");
     delay(500);
     ESP.restart();
+    return;
+  }
+  
+  // Szezon mód: /season [auto|be|ki]
+  if (text.startsWith("/season") && isAdmin) {
+    int sp = text.indexOf(' ');
+    String arg = (sp > 0) ? text.substring(sp + 1) : "";
+    arg.trim();
+    
+    bool changed = false;
+    if (arg == "auto") {
+      seasonMode = SEASON_AUTO;
+      changed = true;
+    } else if (arg == "be" || arg == "on") {
+      seasonMode = SEASON_ON;
+      changed = true;
+    } else if (arg == "ki" || arg == "off") {
+      seasonMode = SEASON_OFF;
+      changed = true;
+    }
+    
+    if (changed) {
+      saveSchedule();  // seasonMode is mentődik
+      float mult = seasonalMultiplier();
+      String msg = "🌿 Szezon mód: *";
+      msg += seasonModeName();
+      msg += "*\n";
+      if (seasonMode == SEASON_AUTO) {
+        msg += "Automatikus hónap alapján:\n";
+        msg += (mult == 0.0) ? "→ Most TÉL van, ütemezett öntözés KI" 
+                             : ("→ Szorzó: " + String(mult, 1) + "x");
+      } else if (seasonMode == SEASON_ON) {
+        msg += "Ütemezett öntözés MINDIG aktív (1x szorzó)";
+      } else {
+        msg += "Ütemezett öntözés KI — csak kézi /zoneX parancs működik";
+      }
+      bot.sendMessage(chatId, msg, "Markdown");
+    } else {
+      // Nincs paraméter — csak mutatja az állapotot
+      float mult = seasonalMultiplier();
+      String msg = "🌿 Szezon mód: *";
+      msg += seasonModeName();
+      msg += "*\n\n";
+      if (seasonMode == SEASON_AUTO) {
+        msg += "Automatikus hónap alapján:\n";
+        msg += (mult == 0.0) ? "→ Most TÉL van, ütemezett öntözés KI" 
+                             : ("→ Szorzó: " + String(mult, 1) + "x");
+      } else if (seasonMode == SEASON_ON) {
+        msg += "Ütemezett öntözés MINDIG aktív (1x szorzó)";
+      } else {
+        msg += "Ütemezett öntözés KI — csak kézi /zoneX parancs működik";
+      }
+      msg += "\n\nBeállítás:\n/season auto — hónap alapján\n/season be — mindig locsol\n/season ki — sosem locsol";
+      bot.sendMessage(chatId, msg, "Markdown");
+    }
     return;
   }
   
