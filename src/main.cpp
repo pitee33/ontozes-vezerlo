@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.0"
+#define FIRMWARE_VERSION  "1.6.1"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -1425,15 +1425,28 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
   text.trim();
   text.toLowerCase();
   
+  // Telegram autocomplete: parancs @botnevet utótaggal jöhet
+  // pl. "/help@pitee33_ontozesvezerles_1_bot" → "/help"
+  if (text.startsWith("/") && text.indexOf("@") > 0) {
+    text = text.substring(0, text.indexOf("@"));
+  }
+  
   wakeOled(); // Parancs érkezett — OLED ébresztés
   
   if (text == "/help" || text == "/start") {
-    bot.sendMessage(chatId, getHelpText(isAdmin), "Markdown");
+    bool sent = bot.sendMessage(chatId, getHelpText(isAdmin), "Markdown");
+    if (!sent) {
+      // Markdown parse hiba fallback — ékezetek/jelek miatt
+      bot.sendMessage(chatId, getHelpText(isAdmin), "");
+    }
     return;
   }
   
   if (text == "/status") {
-    bot.sendMessage(chatId, getStatusText(), "Markdown");
+    bool sent = bot.sendMessage(chatId, getStatusText(), "Markdown");
+    if (!sent) {
+      bot.sendMessage(chatId, getStatusText(), "");  // fallback parse nélkül
+    }
     return;
   }
   
