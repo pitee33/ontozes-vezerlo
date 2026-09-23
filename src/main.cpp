@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.1"
+#define FIRMWARE_VERSION  "1.6.2"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -180,6 +180,10 @@ unsigned long lastWeatherCheck = 0;
 bool wifiConnected = false;
 bool ntpSynced = false;
 String currentVersion = FIRMWARE_VERSION;
+
+// Boot diagnosztika (naponta többszöri reboot okának megállapításához)
+String lastResetReason = "?";
+int lastBootCount = 0;
 
 // DHT11 szenzor
 DHT dht(DHT_PIN, DHT_TYPE);
@@ -973,7 +977,9 @@ void checkWeather() {
   HTTPClient http;
   http.begin(client, WEATHER_URL);
   http.setTimeout(10000);
+  ESP.wdtFeed();  // WDT etetés a blokkoló HTTP hívás előtt
   int code = http.GET();
+  ESP.wdtFeed();  // WDT etetés a blokkoló HTTP hívás után
   Serial.println("Weather HTTP code: " + String(code));
   
   if (code != HTTP_CODE_OK) {
@@ -1160,6 +1166,7 @@ void syncNTP(bool silent = false) {
   Serial.println("NTP szinkron...");
   configTime(2 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   for (int i = 0; i < 10; i++) {
+    ESP.wdtFeed();  // WDT etetés a blokkoló várakozás alatt
     time_t now = time(nullptr);
     if (now > 100000) {
       ntpSynced = true;
@@ -1359,7 +1366,8 @@ String getStatusText() {
   }
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t totalHeap = 81920;
-  txt += "💾 Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB\n";
+  txt += "💾 Heap: " + String(freeHeap / 1024) + "/" + String(totalHeap / 1024) + " kB (max blokk: " + String(ESP.getMaxFreeBlockSize() / 1024) + " kB)\n";
+  txt += "🔧 Boot: #" + String(lastBootCount) + " (" + lastResetReason + ")\n";
   txt += "⏱ Uptime: " + uptimeStr() + "\n";
   if (weatherChecked) {
     txt += "🌤 " + String(todayRainMm, 1) + "mm/" + String(todayRainProb) + "% ";
@@ -1804,6 +1812,17 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   
+  // Reset okának kiírása (diagnosztika — naponta többszöri reboot okának megállapítása)
+  String resetReason = ESP.getResetReason();
+  uint32_t bootCount = 0;
+  // RTC memory: boot számláló — soft WDT/hard reset után is megmarad
+  ESP.rtcUserMemoryRead(0, &bootCount, sizeof(bootCount));
+  bootCount++;
+  ESP.rtcUserMemoryWrite(0, &bootCount, sizeof(bootCount));
+  Serial.printf("BOOT #%u — Reset reason: %s\n", bootCount, resetReason.c_str());
+  lastResetReason = resetReason;
+  lastBootCount = (int)bootCount;
+  
   // Relé pin-ek — aktív magas, boot-kor LOW (ki)
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
@@ -1886,7 +1905,8 @@ void setup() {
     String bootMsg = "🌿 Öntözésvezérlés elindult!\n";
     bootMsg += "IP: " + WiFi.localIP().toString() + "\n";
     bootMsg += "FW: " + currentVersion + "\n";
-    bootMsg += "NTP: " + String(ntpSynced ? "OK" : "FAILED");
+    bootMsg += "NTP: " + String(ntpSynced ? "OK" : "FAILED") + "\n";
+    bootMsg += "🔧 Boot #" + String(lastBootCount) + " | Oka: " + lastResetReason;
     sendTelegram(bootMsg, true);
     
     // Telegram parancs menü regisztrálása (/ gomb → autocomplete)
@@ -2020,10 +2040,36 @@ void loop() {
   // WiFi reconnect
   if (WiFi.status() != WL_CONNECTED) {
     wifiConnected = false;
-    WiFi.reconnect();
-    delay(1000);
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
+    static unsigned long lastWifiAttempt = 0;
+    // Csak 10 másodpercenként próbálkozzon, ne blokkolja a loop-ot delay-vel
+    if (now - lastWifiAttempt > 10000) {
+      lastWifiAttempt = now;
+      Serial.println("WiFi reconnect próbálkozás...");
+      WiFi.reconnect();
+      ESP.wdtFeed();
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.println("WiFi visszatért!");
+      }
+    }
+  }
+  
+  // Heap figyelés — ha kritikusra csökken, warnol + reset
+  // (memória fragmentáció a gyakori rebootozás oka lehet)
+  static unsigned long lastHeapCheck = 0;
+  if (now - lastHeapCheck > 60000) {  // percenként
+    lastHeapCheck = now;
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 6000) {
+      // Kritikus — 6KB alatt már a TLS/SSL nem fér el stabilan
+      Serial.printf("KRITIKUS HEAP: %u B — restart!\n", freeHeap);
+      String msg = "⚠️ Kritikus heap (" + String(freeHeap) + 
+                   " B) — újraindítás a stabilitásért. Boot #" + String(lastBootCount);
+      sendTelegram(msg, true);
+      delay(500);
+      ESP.restart();
+    } else if (freeHeap < 12000) {
+      Serial.printf("ALACSONY HEAP: %u B\n", freeHeap);
     }
   }
   
