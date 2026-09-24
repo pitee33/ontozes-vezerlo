@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.2"
+#define FIRMWARE_VERSION  "1.6.3"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -184,6 +184,23 @@ String currentVersion = FIRMWARE_VERSION;
 // Boot diagnosztika (naponta többszöri reboot okának megállapításához)
 String lastResetReason = "?";
 int lastBootCount = 0;
+String lastRestartCodeName = "n/a";
+
+// RTC-mem restart ok logolás — akkor is látszik, ha a Telegram küldés elhasal
+// RTC layout: [0]=bootCount(u32), [1]=restartReasonCode(u32)
+// Kódok: 1=heap_őr, 2=OTA sikeres, 3=OTA hiba, 4=/reboot parancs, 5=heap_őr_küldés_UTÁN
+void logRestartReason(uint32_t code) {
+  ESP.rtcUserMemoryWrite(1 * 4, &code, sizeof(code));
+}
+String restartReasonCodeName(uint32_t code) {
+  switch (code) {
+    case 1: return "heap-or (kritikus memoria)";
+    case 2: return "OTA sikeres";
+    case 3: return "OTA hiba";
+    case 4: return "/reboot parancs";
+    default: return "ismeretlen/nem logolt";
+  }
+}
 
 // DHT11 szenzor
 DHT dht(DHT_PIN, DHT_TYPE);
@@ -1295,6 +1312,7 @@ void doOTAUpdate() {
   if (written == (size_t)totalSize && Update.end(true) && Update.isFinished()) {
     Serial.println("OTA SUCCESS! Reboot...");
     http.end();
+    logRestartReason(2);  // OTA sikeres
     delay(500);
     ESP.restart();
   } else {
@@ -1305,6 +1323,7 @@ void doOTAUpdate() {
     delay(500);
     securedClient.setInsecure();
     botAdmin.sendMessage(ADMIN_CHAT_ID, err, "");
+    logRestartReason(3);  // OTA hiba
     delay(2000);
     ESP.restart();
   }
@@ -1585,6 +1604,7 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
   
   if (text == "/reboot") {
     bot.sendMessage(chatId, "🔄 Újraindítás...", "");
+    logRestartReason(4);  // /reboot parancs
     delay(500);
     ESP.restart();
     return;
@@ -1815,13 +1835,21 @@ void setup() {
   // Reset okának kiírása (diagnosztika — naponta többszöri reboot okának megállapítása)
   String resetReason = ESP.getResetReason();
   uint32_t bootCount = 0;
-  // RTC memory: boot számláló — soft WDT/hard reset után is megmarad
+  uint32_t prevRestartCode = 0;
+  // RTC memory: boot számláló + restart ok kód — soft WDT/hard reset után is megmarad
   ESP.rtcUserMemoryRead(0, &bootCount, sizeof(bootCount));
+  ESP.rtcUserMemoryRead(1 * 4, &prevRestartCode, sizeof(prevRestartCode));
   bootCount++;
   ESP.rtcUserMemoryWrite(0, &bootCount, sizeof(bootCount));
-  Serial.printf("BOOT #%u — Reset reason: %s\n", bootCount, resetReason.c_str());
+  Serial.printf("BOOT #%u — Reset reason: %s | Elozo restart oka: %s\n", 
+                bootCount, resetReason.c_str(), 
+                restartReasonCodeName(prevRestartCode).c_str());
   lastResetReason = resetReason;
   lastBootCount = (int)bootCount;
+  lastRestartCodeName = restartReasonCodeName(prevRestartCode);
+  // RTC kód törlése — csak az első booton mutassa
+  uint32_t zero = 0;
+  ESP.rtcUserMemoryWrite(1 * 4, &zero, sizeof(zero));
   
   // Relé pin-ek — aktív magas, boot-kor LOW (ki)
   pinMode(RELAY1_PIN, OUTPUT);
@@ -1907,6 +1935,9 @@ void setup() {
     bootMsg += "FW: " + currentVersion + "\n";
     bootMsg += "NTP: " + String(ntpSynced ? "OK" : "FAILED") + "\n";
     bootMsg += "🔧 Boot #" + String(lastBootCount) + " | Oka: " + lastResetReason;
+    if (lastRestartCodeName != "ismeretlen/nem logolt" && lastRestartCodeName != "n/a") {
+      bootMsg += "\n📎 Restart indította: " + lastRestartCodeName;
+    }
     sendTelegram(bootMsg, true);
     
     // Telegram parancs menü regisztrálása (/ gomb → autocomplete)
@@ -2066,6 +2097,7 @@ void loop() {
       String msg = "⚠️ Kritikus heap (" + String(freeHeap) + 
                    " B) — újraindítás a stabilitásért. Boot #" + String(lastBootCount);
       sendTelegram(msg, true);
+      logRestartReason(1);  // RTC-be: heap-őr okozta
       delay(500);
       ESP.restart();
     } else if (freeHeap < 12000) {
