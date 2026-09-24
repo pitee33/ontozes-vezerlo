@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.3"
+#define FIRMWARE_VERSION  "1.6.4"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -185,6 +185,7 @@ String currentVersion = FIRMWARE_VERSION;
 String lastResetReason = "?";
 int lastBootCount = 0;
 String lastRestartCodeName = "n/a";
+String lastResetInfo = "";
 
 // RTC-mem restart ok logolás — akkor is látszik, ha a Telegram küldés elhasal
 // RTC layout: [0]=bootCount(u32), [1]=restartReasonCode(u32)
@@ -198,7 +199,26 @@ String restartReasonCodeName(uint32_t code) {
     case 2: return "OTA sikeres";
     case 3: return "OTA hiba";
     case 4: return "/reboot parancs";
+    case 5: return "ejszakai karbantartas (04:00)";
     default: return "ismeretlen/nem logolt";
+  }
+}
+
+// Exception okkód nevek (EXCCAUSE)
+String exccauseName(uint32_t c) {
+  switch (c) {
+    case 0:  return "IllegalInstruction";
+    case 1:  return "Syscall";
+    case 2:  return "InstructionFetchError";
+    case 3:  return "LoadStoreError";
+    case 4:  return "LoadProhibited (olv null/ervenytelen cim)";
+    case 5:  return "StoreProhibited (iro null/ervenytelen cimre)";
+    case 6:  return "Privilege";
+    case 7:  return "Alignment";
+    case 9:  return "InsnFetchProhibited";
+    case 28: return "LoadProhibited (cache)";
+    case 29: return "StoreProhibited (cache)";
+    default: return "egyeb";
   }
 }
 
@@ -1834,6 +1854,7 @@ void setup() {
   
   // Reset okának kiírása (diagnosztika — naponta többszöri reboot okának megállapítása)
   String resetReason = ESP.getResetReason();
+  String resetInfo = ESP.getResetInfo();  // Exception esetén: okkód + epc1 + excvaddr
   uint32_t bootCount = 0;
   uint32_t prevRestartCode = 0;
   // RTC memory: boot számláló + restart ok kód — soft WDT/hard reset után is megmarad
@@ -1844,9 +1865,11 @@ void setup() {
   Serial.printf("BOOT #%u — Reset reason: %s | Elozo restart oka: %s\n", 
                 bootCount, resetReason.c_str(), 
                 restartReasonCodeName(prevRestartCode).c_str());
+  Serial.println("Reset info: " + resetInfo);
   lastResetReason = resetReason;
   lastBootCount = (int)bootCount;
   lastRestartCodeName = restartReasonCodeName(prevRestartCode);
+  lastResetInfo = resetInfo;  // Exception részletek a boot üzenethez
   // RTC kód törlése — csak az első booton mutassa
   uint32_t zero = 0;
   ESP.rtcUserMemoryWrite(1 * 4, &zero, sizeof(zero));
@@ -1935,6 +1958,10 @@ void setup() {
     bootMsg += "FW: " + currentVersion + "\n";
     bootMsg += "NTP: " + String(ntpSynced ? "OK" : "FAILED") + "\n";
     bootMsg += "🔧 Boot #" + String(lastBootCount) + " | Oka: " + lastResetReason;
+    if (lastResetInfo.length() > 0 && lastResetInfo.indexOf("Fatal") >= 0) {
+      // Exception részletek — crash pont lokalizálásához
+      bootMsg += "\n💣 " + lastResetInfo;
+    }
     if (lastRestartCodeName != "ismeretlen/nem logolt" && lastRestartCodeName != "n/a") {
       bootMsg += "\n📎 Restart indította: " + lastRestartCodeName;
     }
@@ -2002,6 +2029,26 @@ void loop() {
   
   // Napi limit reset (éjfélkor)
   checkDailyReset();
+  
+  // Éjszakai karbantartás: 04:00-kor kontrollált restart
+  // (megelőzi a heap-fragmentáció okozta exception-t; ilyenkor úgyse locsol)
+  if (ntpSynced) {
+    static bool maintenanceDone = false;
+    time_t nowT = time(nullptr);
+    struct tm *tmnow = localtime(&nowT);
+    if (tmnow->tm_hour == 4 && !maintenanceDone) {
+      maintenanceDone = true;
+      Serial.println("Ejszakai karbantartas — kontrollalt restart");
+      String msg = "🌙 04:00 ejszakai karbantartas — kontrollalt restart (memoria tisztitas).";
+      msg += " Heap elotte: " + String(ESP.getFreeHeap()) + " B";
+      msg += ", boot #" + String(lastBootCount);
+      sendTelegram(msg, true);
+      logRestartReason(5);
+      delay(500);
+      ESP.restart();
+    }
+    if (tmnow->tm_hour != 4) maintenanceDone = false;
+  }
   
   // Ütemezés ellenőrzése (1 másodpercenként)
   if (now - lastScheduleCheck > 1000) {
