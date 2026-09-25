@@ -52,6 +52,22 @@
 #define BOT_TOKEN_FAMILY  "8824963625:AAGecULECaM03134n7ejlOAs8xB5ytoR4mk"
 #define FAMILY_CHAT_ID    "8853524984"
 
+// Webhook öngyógyítás: külső szolgáltatás (tele.goldenherd.com) újra-newra
+// beállítja a webhookot a botjainkra, ami megöli a getUpdates pollt (409).
+// Induláskor és poll-hibánál töröljük.
+void deleteWebhookIfNeeded(const char* botToken, WiFiClientSecure &client) {
+  // Egyszerű Telegram API hívás: deleteWebhook (GET, üres body elég)
+  HTTPClient http;
+  String url = String("https://api.telegram.org/bot") + botToken + "/deleteWebhook";
+  http.begin(client, url);
+  int code = http.GET();
+  http.end();
+  Serial.print("[webhook-guard] deleteWebhook (");
+  Serial.print(botToken);
+  Serial.print("): HTTP ");
+  Serial.println(code);
+}
+
 
 // Relé board (aktív magas — HIGH = be, LOW = ki)
 // FIGYELEM: Z3 áthelyezve D3-ról D0-ra (GPIO0 felszabadítva FLASH gombnak)
@@ -82,7 +98,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.5"
+#define FIRMWARE_VERSION  "1.6.6"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -1866,6 +1882,10 @@ void handleBotUpdates(UniversalTelegramBot &bot, WiFiClientSecure &client, bool 
   int numNew = bot.getUpdates(bot.last_message_received + 1);
   if (numNew < 0) {
     Serial.println("Bot poll HIBA, SSL reset");
+    // Öngyógyítás: 409 = webhook aktív a boton → töröljük, hogy a poll éljen
+    // (a hívó oldalon a securedClient = admin, securedClient2 = family bot)
+    const char* tok = (client == securedClient) ? BOT_TOKEN_ADMIN : BOT_TOKEN_FAMILY;
+    deleteWebhookIfNeeded(tok, client);
     client.stop();
     delay(100);
     client.setInsecure();
@@ -2017,6 +2037,10 @@ void setup() {
       bootMsg += "\n📎 Restart indította: " + lastRestartCodeName;
     }
     sendTelegram(bootMsg, true);
+    
+    // Webhook-guard induláskor: külső szolgáltatás újraállíthatja, töröljük mindkét boton
+    deleteWebhookIfNeeded(BOT_TOKEN_ADMIN, securedClient);
+    deleteWebhookIfNeeded(BOT_TOKEN_FAMILY, securedClient2);
     
     // Ha OTA indította a restartot — verzió egyezés ellenőrzés
     if (prevRestartCode == 2) {
