@@ -82,7 +82,7 @@
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.4"
+#define FIRMWARE_VERSION  "1.6.5"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -186,12 +186,38 @@ String lastResetReason = "?";
 int lastBootCount = 0;
 String lastRestartCodeName = "n/a";
 String lastResetInfo = "";
+String lastSeenGithubVersion = "";  // checkFirmware tárolja ide
 
-// RTC-mem restart ok logolás — akkor is látszik, ha a Telegram küldés elhasal
-// RTC layout: [0]=bootCount(u32), [1]=restartReasonCode(u32)
-// Kódok: 1=heap_őr, 2=OTA sikeres, 3=OTA hiba, 4=/reboot parancs, 5=heap_őr_küldés_UTÁN
+// RTC-mem diag struktúra — TÁVOL a rendszer által használt RTC területtől.
+// Tanulság: RTC offset 0 környékét a ROM Exception után felülírja (a #-352317439
+// garbage ebből jött), ezért byte 400-nál tárolunk + magic/checksum ellenőrzéssel.
+struct RtcDiagData {
+  uint32_t magic;
+  uint32_t bootCount;
+  uint32_t restartCode;
+  uint32_t checksum;
+};
+#define RTC_DIAG_MAGIC   0xA5C0F00DUL
+#define RTC_DIAG_OFFSET  400  // byte — RTC user memória (512 B) biztonságos sávja
+
+void rtcDiagWrite(const RtcDiagData &d) {
+  ESP.rtcUserMemoryWrite(RTC_DIAG_OFFSET, (uint32_t*)&d, sizeof(d));
+}
+
+bool rtcDiagRead(RtcDiagData &d) {
+  ESP.rtcUserMemoryRead(RTC_DIAG_OFFSET, (uint32_t*)&d, sizeof(d));
+  return (d.magic == RTC_DIAG_MAGIC &&
+          d.checksum == (d.magic ^ d.bootCount ^ d.restartCode));
+}
+
+// Kódok: 1=heap-őr, 2=OTA sikeres, 3=OTA hiba, 4=/reboot, 5=éjszakai karbantartás
 void logRestartReason(uint32_t code) {
-  ESP.rtcUserMemoryWrite(1 * 4, &code, sizeof(code));
+  RtcDiagData d;
+  d.magic = RTC_DIAG_MAGIC;
+  d.bootCount = (uint32_t)lastBootCount;
+  d.restartCode = code;
+  d.checksum = d.magic ^ d.bootCount ^ d.restartCode;
+  rtcDiagWrite(d);
 }
 String restartReasonCodeName(uint32_t code) {
   switch (code) {
@@ -1227,7 +1253,9 @@ void checkFirmware() {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.begin(client, FIRMWARE_VER_URL);
+  // Cache-buster: a version.txt-hez egyedi query string — a CDN mindig frisset adjon
+  String verUrl = String(FIRMWARE_VER_URL) + "?cb=" + String(millis());
+  http.begin(client, verUrl);
   http.setTimeout(15000);
   int code = http.GET();
   Serial.println("FW check HTTP code: " + String(code));
@@ -1236,6 +1264,7 @@ void checkFirmware() {
     http.end();
     latest.trim();
     Serial.println("GitHub version: " + latest + " | local: " + currentVersion);
+    lastSeenGithubVersion = latest;  // OTA után az ellenőrzéshez
     if (latest != currentVersion && latest.length() > 0) {
       String msg = "📦 Új firmware elérhető!\n";
       msg += "Jelenlegi: " + currentVersion + "\n";
@@ -1266,7 +1295,9 @@ void doOTAUpdate() {
   ESP.wdtDisable();
   
   HTTPClient http;
-  http.begin(otaClient, FIRMWARE_BIN_URL);
+  // Cache-buster: a millis()-alapú query a CDN-t mindig friss binárisra kényszeríti
+  String binUrl = String(FIRMWARE_BIN_URL) + "?cb=" + String(millis());
+  http.begin(otaClient, binUrl);
   http.setTimeout(30000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   
@@ -1346,6 +1377,23 @@ void doOTAUpdate() {
     logRestartReason(3);  // OTA hiba
     delay(2000);
     ESP.restart();
+  }
+}
+
+// OTA verzió-ellenőrzés: a flashelt bináris FIRMWARE_VERSION értéke
+// egyezik-e a GitHubon látott verzióval. Ha nem (CDN cache régi binárist adott),
+// figyelmeztet — így sosem "frissül" látszólag új verzióra a régi fw-vel.
+void verifyOtaVersion(String expectedVersion) {
+  if (currentVersion == expectedVersion) {
+    botAdmin.sendMessage(ADMIN_CHAT_ID, 
+      "✅ OTA OK — FW " + currentVersion + " fut", "");
+  } else {
+    String msg = "⚠️ OTA GYANÚS!\n";
+    msg += "Várt verzió: " + expectedVersion + "\n";
+    msg += "Futó verzió: " + currentVersion + "\n";
+    msg += "A CDN valószínűleg régi binárist adott (cache).\n";
+    msg += "Próbáld újra: /upgrade";
+    botAdmin.sendMessage(ADMIN_CHAT_ID, msg, "");
   }
 }
 
@@ -1618,6 +1666,7 @@ void handleCommand(UniversalTelegramBot &bot, String text, String chatId, bool i
   }
   
   if (text == "/upgrade") {
+    checkFirmware();  // lastSeenGithubVersion frissen — OTA utáni ellenőrzéshez
     doOTAUpdate();
     return;
   }
@@ -1855,13 +1904,18 @@ void setup() {
   // Reset okának kiírása (diagnosztika — naponta többszöri reboot okának megállapítása)
   String resetReason = ESP.getResetReason();
   String resetInfo = ESP.getResetInfo();  // Exception esetén: okkód + epc1 + excvaddr
-  uint32_t bootCount = 0;
-  uint32_t prevRestartCode = 0;
-  // RTC memory: boot számláló + restart ok kód — soft WDT/hard reset után is megmarad
-  ESP.rtcUserMemoryRead(0, &bootCount, sizeof(bootCount));
-  ESP.rtcUserMemoryRead(1 * 4, &prevRestartCode, sizeof(prevRestartCode));
-  bootCount++;
-  ESP.rtcUserMemoryWrite(0, &bootCount, sizeof(bootCount));
+  
+  // RTC diag beolvasás (magic + checksum védett, offset 400)
+  RtcDiagData rtc;
+  bool rtcValid = rtcDiagRead(rtc);
+  uint32_t prevRestartCode = rtcValid ? rtc.restartCode : 0;
+  uint32_t bootCount = rtcValid ? (rtc.bootCount + 1) : 1;
+  rtc.bootCount = bootCount;
+  rtc.restartCode = 0;  // egy booton belül csak egyszer mutatjuk
+  rtc.magic = RTC_DIAG_MAGIC;
+  rtc.checksum = rtc.magic ^ rtc.bootCount ^ rtc.restartCode;
+  rtcDiagWrite(rtc);
+  
   Serial.printf("BOOT #%u — Reset reason: %s | Elozo restart oka: %s\n", 
                 bootCount, resetReason.c_str(), 
                 restartReasonCodeName(prevRestartCode).c_str());
@@ -1870,9 +1924,6 @@ void setup() {
   lastBootCount = (int)bootCount;
   lastRestartCodeName = restartReasonCodeName(prevRestartCode);
   lastResetInfo = resetInfo;  // Exception részletek a boot üzenethez
-  // RTC kód törlése — csak az első booton mutassa
-  uint32_t zero = 0;
-  ESP.rtcUserMemoryWrite(1 * 4, &zero, sizeof(zero));
   
   // Relé pin-ek — aktív magas, boot-kor LOW (ki)
   pinMode(RELAY1_PIN, OUTPUT);
@@ -1966,6 +2017,12 @@ void setup() {
       bootMsg += "\n📎 Restart indította: " + lastRestartCodeName;
     }
     sendTelegram(bootMsg, true);
+    
+    // Ha OTA indította a restartot — verzió egyezés ellenőrzés
+    if (prevRestartCode == 2) {
+      // A GitHubon látott verziót az ellenőrzéshez a checkFirmware tárolja
+      verifyOtaVersion(lastSeenGithubVersion);
+    }
     
     // Telegram parancs menü regisztrálása (/ gomb → autocomplete)
     String cmds = "[";
