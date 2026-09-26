@@ -98,7 +98,7 @@ void deleteWebhookIfNeeded(const char* botToken, WiFiClientSecure &client) {
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.6"
+#define FIRMWARE_VERSION  "1.6.7"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -203,6 +203,7 @@ int lastBootCount = 0;
 String lastRestartCodeName = "n/a";
 String lastResetInfo = "";
 String lastSeenGithubVersion = "";  // checkFirmware tárolja ide
+uint32_t otaRetryCounter = 0;       // OTA auto-retry (RTC-ből bootkor)
 
 // RTC-mem diag struktúra — TÁVOL a rendszer által használt RTC területtől.
 // Tanulság: RTC offset 0 környékét a ROM Exception után felülírja (a #-352317439
@@ -211,6 +212,7 @@ struct RtcDiagData {
   uint32_t magic;
   uint32_t bootCount;
   uint32_t restartCode;
+  uint32_t retryCount;   // OTA auto-retry számláló (max 3)
   uint32_t checksum;
 };
 #define RTC_DIAG_MAGIC   0xA5C0F00DUL
@@ -223,16 +225,29 @@ void rtcDiagWrite(const RtcDiagData &d) {
 bool rtcDiagRead(RtcDiagData &d) {
   ESP.rtcUserMemoryRead(RTC_DIAG_OFFSET, (uint32_t*)&d, sizeof(d));
   return (d.magic == RTC_DIAG_MAGIC &&
-          d.checksum == (d.magic ^ d.bootCount ^ d.restartCode));
+          d.checksum == (d.magic ^ d.bootCount ^ d.restartCode ^ d.retryCount));
 }
 
 // Kódok: 1=heap-őr, 2=OTA sikeres, 3=OTA hiba, 4=/reboot, 5=éjszakai karbantartás
+// 6=OTA auto-retry (heap miatt bukott OTA → restart → friss heap → újrapróbál)
 void logRestartReason(uint32_t code) {
   RtcDiagData d;
   d.magic = RTC_DIAG_MAGIC;
   d.bootCount = (uint32_t)lastBootCount;
   d.restartCode = code;
-  d.checksum = d.magic ^ d.bootCount ^ d.restartCode;
+  d.retryCount = 0;
+  d.checksum = d.magic ^ d.bootCount ^ d.restartCode ^ d.retryCount;
+  rtcDiagWrite(d);
+}
+
+// OTA retry flag beállítása — a boot kódban olvassuk fel és indítjuk újra
+void setOtaRetryFlag(uint32_t count) {
+  RtcDiagData d;
+  d.magic = RTC_DIAG_MAGIC;
+  d.bootCount = (uint32_t)lastBootCount;
+  d.restartCode = 6;  // OTA auto-retry
+  d.retryCount = otaRetryCounter + 1;  // számláló NOVElése — max 3 után leáll
+  d.checksum = d.magic ^ d.bootCount ^ d.restartCode ^ d.retryCount;
   rtcDiagWrite(d);
 }
 String restartReasonCodeName(uint32_t code) {
@@ -242,6 +257,7 @@ String restartReasonCodeName(uint32_t code) {
     case 3: return "OTA hiba";
     case 4: return "/reboot parancs";
     case 5: return "ejszakai karbantartas (04:00)";
+    case 6: return "OTA auto-retry (heap-fagyas utani ujraproba)";
     default: return "ismeretlen/nem logolt";
   }
 }
@@ -1322,13 +1338,17 @@ void doOTAUpdate() {
   Serial.println("OTA HTTP code: " + String(code));
   
   if (code != HTTP_CODE_OK) {
-    String err = "❌ HTTP " + String(code);
+    String err = "❌ OTA HTTP " + String(code) + "\n";
+    err += "Heap a próbálkozáskor: " + String(ESP.getFreeHeap()) + " B\n";
+    err += "Fragmentáció okozhatja — újraindítás után automatikusan újrapróbálom.";
     Serial.println(err);
     http.end();
     ESP.wdtEnable(30000);
     delay(500);
     securedClient.setInsecure();
     botAdmin.sendMessage(ADMIN_CHAT_ID, err, "");
+    // Auto-retry: restart → friss heap → boot kód újraindítja az OTA-t
+    setOtaRetryFlag(1);
     delay(2000);
     ESP.restart();
     return;
@@ -1383,14 +1403,15 @@ void doOTAUpdate() {
     delay(500);
     ESP.restart();
   } else {
-    String err = "❌ written=" + String(written) + "/" + String(totalSize);
+    String err = "❌ OTA written=" + String(written) + "/" + String(totalSize) + "\n";
+    err += "Heap: " + String(ESP.getFreeHeap()) + " B — retry restart után.";
     Serial.println(err);
     http.end();
     ESP.wdtEnable(30000);
     delay(500);
     securedClient.setInsecure();
     botAdmin.sendMessage(ADMIN_CHAT_ID, err, "");
-    logRestartReason(3);  // OTA hiba
+    setOtaRetryFlag(1);
     delay(2000);
     ESP.restart();
   }
@@ -1930,10 +1951,12 @@ void setup() {
   bool rtcValid = rtcDiagRead(rtc);
   uint32_t prevRestartCode = rtcValid ? rtc.restartCode : 0;
   uint32_t bootCount = rtcValid ? (rtc.bootCount + 1) : 1;
+  uint32_t otaRetryCount = rtcValid ? rtc.retryCount : 0;  // OTA auto-retry
   rtc.bootCount = bootCount;
   rtc.restartCode = 0;  // egy booton belül csak egyszer mutatjuk
+  rtc.retryCount = 0;
   rtc.magic = RTC_DIAG_MAGIC;
-  rtc.checksum = rtc.magic ^ rtc.bootCount ^ rtc.restartCode;
+  rtc.checksum = rtc.magic ^ rtc.bootCount ^ rtc.restartCode ^ rtc.retryCount;
   rtcDiagWrite(rtc);
   
   Serial.printf("BOOT #%u — Reset reason: %s | Elozo restart oka: %s\n", 
@@ -1944,6 +1967,7 @@ void setup() {
   lastBootCount = (int)bootCount;
   lastRestartCodeName = restartReasonCodeName(prevRestartCode);
   lastResetInfo = resetInfo;  // Exception részletek a boot üzenethez
+  otaRetryCounter = otaRetryCount;  // RTC-ből — auto-retry állapot
   
   // Relé pin-ek — aktív magas, boot-kor LOW (ki)
   pinMode(RELAY1_PIN, OUTPUT);
@@ -2046,6 +2070,19 @@ void setup() {
     if (prevRestartCode == 2) {
       // A GitHubon látott verziót az ellenőrzéshez a checkFirmware tárolja
       verifyOtaVersion(lastSeenGithubVersion);
+    }
+    
+    // OTA auto-retry: ha az OTA heap miatt bukott, friss boottal újrapróbáljuk (max 3x)
+    if (prevRestartCode == 6 && otaRetryCounter > 0 && otaRetryCounter <= 3) {
+      String msg = "🔄 OTA auto-retry #" + String(otaRetryCounter) + "/3 — ";
+      msg += "újrapróbálom friss memóriával (heap: " + String(ESP.getFreeHeap()) + " B)";
+      botAdmin.sendMessage(ADMIN_CHAT_ID, msg, "");
+      delay(1000);
+      checkFirmware();   // lastSeenGithubVersion frissen
+      doOTAUpdate();    // ez vagy sikerül, vagy újra retry-flag + restart
+    } else if (prevRestartCode == 6 && otaRetryCounter > 3) {
+      botAdmin.sendMessage(ADMIN_CHAT_ID, 
+        "❌ OTA auto-retry kimerült (3 próbálkozás). Kézi /upgrade kell.", "");
     }
     
     // Telegram parancs menü regisztrálása (/ gomb → autocomplete)
