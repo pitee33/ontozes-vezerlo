@@ -98,7 +98,7 @@ void deleteWebhookIfNeeded(const char* botToken, WiFiClientSecure &client) {
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.7"
+#define FIRMWARE_VERSION  "1.6.8"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -204,6 +204,7 @@ String lastRestartCodeName = "n/a";
 String lastResetInfo = "";
 String lastSeenGithubVersion = "";  // checkFirmware tárolja ide
 uint32_t otaRetryCounter = 0;       // OTA auto-retry (RTC-ből bootkor)
+unsigned long otaRetryAtMillis = 0; // OTA cache-retry időpont (0 = nincs pending)
 
 // RTC-mem diag struktúra — TÁVOL a rendszer által használt RTC területtől.
 // Tanulság: RTC offset 0 környékét a ROM Exception után felülírja (a #-352317439
@@ -1382,12 +1383,39 @@ void doOTAUpdate() {
   uint8_t buf[1024];
   size_t written = 0;
   int lastPct = -1;
+  bool versionStringFound = false;
+  // Verzió-string chunk-határon is megtalálható legyen: 8 bájtos áthordás
+  uint8_t carry[8] = {0};
+  size_t carryLen = 0;
   while (written < (size_t)totalSize) {
     size_t avail = stream->available();
     if (avail == 0) { delay(10); continue; }
     size_t rd = stream->readBytes(buf, min((size_t)1024, (size_t)(totalSize - written)));
     if (rd == 0) break;
     written += Update.write(buf, rd);
+    // Verzió-string keresése a binárisban — ha a CDN cache régi binárist adott,
+    // a várt verzió nincs benne → ne flasheljük, retry később
+    if (!versionStringFound && lastSeenGithubVersion.length() > 0) {
+      // carry + aktuális chunk egyben keresése (chunk-határ átfedés)
+      size_t vlen = lastSeenGithubVersion.length();
+      if (vlen <= 8 + rd) {
+        for (size_t k = 0; k + vlen <= carryLen + rd; k++) {
+          bool match = true;
+          for (size_t m = 0; m < vlen; m++) {
+            size_t pos = k + m;
+            uint8_t c = (pos < carryLen) ? carry[pos] : buf[pos - carryLen];
+            if (c != (uint8_t)lastSeenGithubVersion[m]) { match = false; break; }
+          }
+          if (match) { versionStringFound = true; break; }
+        }
+      }
+      // carry frissítése: az utolsó 8 bájt a következő chunk elejéhez
+      carryLen = (rd < 8) ? rd : 8;
+      if (carryLen > 0) {
+        size_t off = rd - carryLen;
+        for (size_t k = 0; k < carryLen; k++) carry[k] = buf[off + k];
+      }
+    }
     int pct = (int)((written * 100) / totalSize);
     if (pct != lastPct && pct % 25 == 0) {
       Serial.println("OTA: " + String(pct) + "%");
@@ -1395,6 +1423,23 @@ void doOTAUpdate() {
     }
   }
   Serial.println("OTA written: " + String(written) + "/" + String(totalSize));
+  
+  // === Verzió-ellenőrzés a flashelés ELŐTT ===
+  if (!versionStringFound && lastSeenGithubVersion.length() > 0) {
+    // A letöltött binárisban NINCS a várt verzió-string → a CDN cache régit adott
+    String msg = "⚠️ OTA elhalasztva: a binárisban nincs a várt verzió (" +
+                 lastSeenGithubVersion + ").\n";
+    msg += "A CDN még a régit cache-eli — 10 perc múlva automatikusan újrapróbálom.\n";
+    msg += "(Nem flasheltem, a jelenlegi fw érintetlen.)";
+    Serial.println(msg);
+    http.end();
+    Update.end(false);  // megszakítás, nem flashelünk
+    ESP.wdtEnable(30000);
+    securedClient.setInsecure();
+    botAdmin.sendMessage(ADMIN_CHAT_ID, msg, "");
+    otaRetryAtMillis = millis() + 600000UL;  // 10 perc múlva újra
+    return;  // NEM restartolunk — a fw érintetlen marad
+  }
   
   if (written == (size_t)totalSize && Update.end(true) && Update.isFinished()) {
     Serial.println("OTA SUCCESS! Reboot...");
@@ -1421,6 +1466,7 @@ void doOTAUpdate() {
 // egyezik-e a GitHubon látott verzióval. Ha nem (CDN cache régi binárist adott),
 // figyelmeztet — így sosem "frissül" látszólag új verzióra a régi fw-vel.
 void verifyOtaVersion(String expectedVersion) {
+  if (expectedVersion.length() == 0) return;  // nincs adat — ne riasszon false alarmot
   if (currentVersion == expectedVersion) {
     botAdmin.sendMessage(ADMIN_CHAT_ID, 
       "✅ OTA OK — FW " + currentVersion + " fut", "");
@@ -2209,6 +2255,15 @@ void loop() {
   if (now - lastFirmwareCheck > 21600000) {
     lastFirmwareCheck = now;
     if (wifiConnected) checkFirmware();
+  }
+  
+  // OTA cache-retry: ha a CDN régi binárist adott, 10 perc múlva automatikusan újra
+  if (otaRetryAtMillis != 0 && millis() > otaRetryAtMillis && wifiConnected) {
+    otaRetryAtMillis = 0;
+    Serial.println("OTA cache-retry: újrapróbálom a friss bináris letöltését");
+    botAdmin.sendMessage(ADMIN_CHAT_ID, "🔄 OTA cache-retry: újrapróbálom a letöltést", "");
+    checkFirmware();
+    doOTAUpdate();
   }
   
   // Időjárás ellenőrzés (30 percenként)
