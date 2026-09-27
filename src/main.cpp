@@ -98,7 +98,7 @@ void deleteWebhookIfNeeded(const char* botToken, WiFiClientSecure &client) {
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.8"
+#define FIRMWARE_VERSION  "1.6.9"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -1313,6 +1313,7 @@ void checkFirmware() {
 
 void doOTAUpdate() {
   Serial.println("=== OTA START ===");
+  stopAllZones();  // Biztonság: OTA alatt (és megakadásnál) ne fusson tovább a locsolás
   botAdmin.sendMessage(ADMIN_CHAT_ID, "⏳ OTA indul...", "");
   
   delay(200);
@@ -1387,9 +1388,28 @@ void doOTAUpdate() {
   // Verzió-string chunk-határon is megtalálható legyen: 8 bájtos áthordás
   uint8_t carry[8] = {0};
   size_t carryLen = 0;
+  uint32_t lastDataMs = millis();  // stall-guard: utolsó érkezett adat időpontja
   while (written < (size_t)totalSize) {
     size_t avail = stream->available();
-    if (avail == 0) { delay(10); continue; }
+    if (avail == 0) {
+      // Stall-guard: 30 mpig semmi adat = halott letöltés → abort + retry
+      // (a v1.6.3 itt végtelen delay(10) ciklusban ragadhat meg: WDT letiltva,
+      //  bot halott, ping él — pont a mostani tünetkép)
+      if (millis() - lastDataMs > 30000) {
+        Serial.println("OTA STALL: 30s adat nelkul — abort");
+        http.end();
+        Update.end(false);
+        ESP.wdtEnable(30000);
+        securedClient.setInsecure();
+        botAdmin.sendMessage(ADMIN_CHAT_ID, "❌ OTA letoltes megakadt (30s) — restart, auto-retry", "");
+        setOtaRetryFlag(1);
+        delay(500);
+        ESP.restart();
+      }
+      delay(10);
+      continue;
+    }
+    lastDataMs = millis();
     size_t rd = stream->readBytes(buf, min((size_t)1024, (size_t)(totalSize - written)));
     if (rd == 0) break;
     written += Update.write(buf, rd);
