@@ -98,7 +98,7 @@ void deleteWebhookIfNeeded(const char* botToken, WiFiClientSecure &client) {
 #define MAX_SCHEDULES 4
 
 // Firmware verzió (GitHub publikus repó)
-#define FIRMWARE_VERSION  "1.6.9"
+#define FIRMWARE_VERSION  "1.7.0"
 #define FIRMWARE_BIN_URL   "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/firmware.bin"
 #define FIRMWARE_VER_URL  "https://raw.githubusercontent.com/pitee33/ontozes-vezerlo/main/version.txt"
 
@@ -217,7 +217,16 @@ struct RtcDiagData {
   uint32_t checksum;
 };
 #define RTC_DIAG_MAGIC   0xA5C0F00DUL
-#define RTC_DIAG_OFFSET  400  // byte — RTC user memória (512 B) biztonságos sávja
+// ⚠️ TANULSÁG (ez ölte meg az OTA-t v1.6.3-1.6.4-ben):
+// Az Arduino rtcUserMemory SZÓ 0-31 = az eboot bootloader OTA-parancsának
+// területe (RTC_MEM @0x60001200, lásd eboot_command.h)! A v1.6.3
+// logRestartReason a 4. SZÓRA (RTC_MEM[4] = args[2]) írta a restart-kódot
+// → minden sikeres OTA letöltés után tönkrement a parancs CRC-je → az eboot
+// SOHA nem másolta át az új firmware-t. Bizonyíték: a "Boot #-352317439"
+// = 0xEB001001 = EBOOT_MAGIC+1 volt. Szó 32-127 biztonságos.
+// MEGJEGYZÉS: az offset-et a framework SZÓBAN méri: offset*4+size <= 512.
+// A régi 400-as érték érvénytelen volt (1600>512) → néma no-op (ártalmatlan).
+#define RTC_DIAG_OFFSET  64  // RTC szó — eboot-tér (0-31) után, biztonságos
 
 void rtcDiagWrite(const RtcDiagData &d) {
   ESP.rtcUserMemoryWrite(RTC_DIAG_OFFSET, (uint32_t*)&d, sizeof(d));
